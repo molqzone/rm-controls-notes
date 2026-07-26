@@ -62,7 +62,7 @@ gimbal_controller:
 rm-controls 的架构可以概括为：
 
 - ROS control 的 hardware_interface 层
-- 一套自定义的决策中间件（rm_manual）
+- 一套自定义的决策中间件（决策核心 `rm_manual` + `rm_dbus`/`rm_vt`/`rm_referee` 三个 I/O 驱动）
 - 9 个控制器插件
 - 6 个硬件接口
 - 一个标定框架
@@ -78,17 +78,42 @@ rm-controls 的架构可以概括为：
 
 决策层运行在 100Hz 回调中，不参与实时控制循环。它与控制层通过 ROS 话题通信，与硬件层也通过 ROS 话题读取状态（/joint_states、/actuator_states）。
 
+决策层不止 `rm_manual` 一个节点。它由**决策核心**和一圈**输入/输出驱动**组成——后者负责把物理世界的操作手、裁判系统接口翻译成 ROS 话题，喂给决策核心，也把决策核心的反馈发回去：
+
+```
+决策层（都跑在非实时、~100Hz）
+├── rm_manual        决策核心：事件解析、控制器编排、标定流水线、指令发布
+└── I/O 驱动
+    ├── rm_dbus      DT7 遥控器输入 → DbusData
+    ├── rm_vt        图传链路键鼠输入 → VTKeyboardMouseData；客户端 UI 输出
+    └── rm_referee   裁判系统输入（比赛状态/血量/功率/热量）；客户端/地图输出
+```
+
+这几个 I/O 驱动都是独立 ROS 节点，**不碰 1kHz 控制环、不直接操作电机**——它们的数据只流向 / 流出 `rm_manual`。这就是把它们归到决策层的理由：它们解决的是"操作手、比赛规则怎么和机器人的大脑对话"，属于决策关心的事，而不是"算法怎么算"（控制层）或"跟执行器硬件怎么说话"（硬件抽象层）。
+
 ### 3.2 控制层
+
+TODO: joint+link only 的 robomaster 机器人
+电控眼中目无全牛的 RoboMaster机器人
 
 控制层解决的核心问题：ROS control 的标准 controller 只提供一个空的 `update()` 回调和几个 `JointHandle`，但 RoboMaster 需要复杂的控制算法和状态机。
 
 控制层运行在 **1kHz 实时循环**中（与硬件层同线程），通过 `hardware_interface` 的 C++ 指针直通读写硬件数据，不走 ROS 话题序列化。
 
-9 个控制器插件按用途分为三类：
-
 #### 3.2.1 运动控制
 
-真正参与 1kHz 控制环，向 joint 输出力矩 / 速度：
+运动控制控制器是真正参与 1kHz 控制环、向 joint 输出力矩/速度的控制器。它们的划分直接来源于机器人的机械结构——每个机构对应一个控制器，各自 claim 一组互不相交的 joint：
+
+| 机构 | 对应控制器 | 控制的 joint |
+| --- | --- | --- |
+| 底盘 | `chassis_controller` | 4 个轮子 joint |
+| 云台 | `gimbal_controller` | yaw_joint + pitch_joint |
+| 发射机构 | `shooter_controller` | 2 个摩擦轮 + 拨弹盘 joint |
+| 从动关节 | `mimic_joint_controller` | 跟随 pitch_joint 位置（只读） |
+
+因为 joint set 互不相交，所以控制器可以独立启停——标定拨盘时只需停 `shooter_controller`，底盘和云台不受影响。这也是标定体系能工作的前提。
+
+各控制器核心功能：
 
 | 控制器 | 解决什么问题 |
 | --- | --- |
@@ -155,15 +180,15 @@ class MechanicalCalibrationController
 
 ### 3.3 硬件抽象层
 
-硬件抽象层解决的核心问题：ROS control 的标准 `hardware_interface` 只认识 `JointState` 和 `EffortJoint`，但 RoboMaster 的硬件有大量特殊需求——电机有不同的通信协议（EtherCAT / CAN）、有不同的类型（RM6020 / M3508 / M2006 / 达妙）、有标定状态需要管理、有 GPIO 和 IMU 等非关节外设。
+硬件抽象层解决的核心问题：ROS control 的标准 `hardware_interface` 只认识 `JointState` 和 `EffortJoint`，但 RoboMaster 的硬件有大量特殊需求——电机有不同的类型（RM6020 / M3508 / M2006 / 达妙）、有标定状态需要管理、有 GPIO 和 IMU 等非关节外设。通信层面，所有电机使用 CAN 协议，`rm_ecat_hw` 通过 EtherCAT 转发 CAN 数据，不直接与电机通信。
 
-硬件抽象层由 `rm_hw` 和 `rm_ecat_hw` 两个包共同实现，继承 ROS control 的 `RobotHW` 基类，运行在 **1kHz** 循环中（与控制层同线程或独立线程）。
+硬件抽象层由 `rm_ecat_hw` 包实现，继承 ROS control 的 `RobotHW` 基类，运行在 **1kHz** 循环中（与控制层同线程或独立线程）。
 
 它做了三件事：
 
 #### 3.3.1 封装通信协议
 
-`rm_ecat_hw` 负责 EtherCAT 帧的收发——管理从站拓扑（哪块板、什么协议、挂在哪张网卡上），把 `RmMotor` / `MitMotor` 等不同协议电机封装成统一的 `ActuatorData` 结构体。`rm_hw` 负责 CAN 总线，管理 CAN ID、总线索引、电机类型映射。
+`rm_ecat_hw` 负责 EtherCAT 帧的收发——管理从站拓扑（哪块板、什么协议、挂在哪张网卡上），把 `RmMotor` / `MitMotor` 等不同协议电机封装成统一的 `ActuatorData` 结构体。
 
 #### 3.3.2 提供 6 个自定义 hardware_interface
 
@@ -179,24 +204,19 @@ class MechanicalCalibrationController
 
 #### 3.3.3 管理 Transmission 与标定状态
 
-硬件层负责通过 Transmission 换算：电机原始编码器读数 × 减速比 + offset → 关节弧度；反向把力矩指令 ÷ 减速比 → 电机电流。
-
-标定状态的管理是硬件层和标定控制器协作完成的：
-
-- 硬件层在初始化时读取 YAML 的 `need_calibration` 标志，存入 `ActuatorExtraHandle`
-- `write()` 时如果电机未标定，跳过限幅，允许标定控制器自由转动电机
-- 硬件层读编码器时自动加上当前 offset，上层 `getPosition()` 拿到的是修正后的值
-- 标定控制器完成标定后通过 `setOffset()` 写入 offset，通过 `setCalibrated()` 标记完成
+硬件层负责在关节空间与执行器空间之间做映射：控制器发出的关节指令经过 Transmission 换算为具体的电机指令，电机反馈的编码器数据也经此换算回关节值。标定状态的管理同样由硬件层承载。
 
 队内现在已经不走 Linux 到 CAN 的通信，因此我们只考虑 rm_ecat_hw。
 
 ### 3.4 架构总结
 
+三个层次的具体运行机制是：ROS control 的 `controller_manager` 负责控制器的生命周期管理（加载/启动/停止），它在 `rm_manual` 节点内部被调用——决策层决定何时切换，`controller_manager` 执行实际切换。每个控制器以动态库插件形式加载，在硬件层的 1kHz 循环中被周期性调用。每个周期执行 **read → 所有活跃 controller 的 update → write** 三步。
+
 三个层次的分工可以归纳为一张表：
 
 | 层次 | 频率 | 通信方式 | 管什么 |
 | --- | --- | --- | --- |
-| 决策层（rm_manual） | 100Hz | ROS 话题 ↔ 控制层 | 什么时候做、做什么 |
+| 决策层（rm_manual 决策核心<br>+ rm_dbus/rm_vt/rm_referee I/O 驱动）<br>内含 controller_manager | 100Hz | ROS 话题 ↔ 控制层<br>ROS 服务 ↔ controller_manager<br>串口/DBus/图传 ↔ 操作手·裁判系统 | 什么时候做、做什么 |
 | 控制层（rm_controllers） | 1kHz | C++ 指针 ↔ 硬件层 | 算法怎么算 |
 | 硬件抽象层（rm_ecat_hw） | 1kHz | EtherCAT 帧 ↔ 物理硬件 | 跟硬件怎么说话 |
 
