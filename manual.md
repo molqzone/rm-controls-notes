@@ -8,17 +8,41 @@
 
 ## 1. rm_manual 的定位
 
-回到 overview 的三层架构：决策层在最上面，它**不参与 1kHz 实时控制环**。控制层的底盘/云台/发射控制器在 1kHz 里算力矩，而决策层跑在**100Hz** 的普通回调里，通过 ROS 话题和下层通信。
+回到 overview 的三层架构：决策层在最上面，它**不参与 1kHz 实时控制环**。控制层的底盘/云台/发射控制器在 1kHz 里算力矩，而决策层跑在**约 100Hz** 的 `ros::Rate` 循环里（不是实时线程，就是普通 ROS 节点），通过 ROS 话题和下层通信。
 
 决策层不止 `rm_manual` 一个节点——它是**决策核心 `rm_manual` + 一圈 I/O 驱动节点**（overview §3.1）。三个 I/O 驱动把物理接口翻译成话题喂给核心、也把核心的反馈发回去，全都非实时、都不碰控制环：
 
-| I/O 驱动 | 输入 → rm_manual | rm_manual → 输出 |
-| --- | --- | --- |
-| `rm_dbus` | `DbusData`（DT7 遥控器拨杆/键鼠） | —— |
-| `rm_vt` | `VTKeyboardMouseData`（图传链路键鼠） | 客户端 UI / 自定义数据 |
-| `rm_referee` | 比赛状态/血量/功率/热量 | 客户端 UI / 地图交互 |
+| I/O 驱动 | 输入 → rm_manual | rm_manual → 输出 | 物理链路 | 频率 |
+| --- | --- | --- | --- | --- |
+| `rm_dbus` | `DbusData`（DT7 遥控器拨杆/键鼠） | —— | 串口 `/dev/usbDbus` | 60Hz |
+| `rm_vt` | `VTKeyboardMouseData`（图传链路键鼠） | 客户端 UI / 自定义数据 | 串口 `/dev/usbImagetran`（921600 baud） | 100Hz |
+| `rm_referee` | 比赛状态/血量/功率/热量<br>+ 超级电容电源管理数据 | 客户端 UI / 地图交互<br>+ 超电状态指令 | 串口 `/dev/usbReferee`（115200 baud）<br>拓扑：裁判系统 → 超电 → 电脑<br>裁判系统 + 超电共线 | 80Hz，下行 UI 默认 150ms 间隔 |
 
-本文主要讲**决策核心** `rm_manual` 自己（下面第 2 节起）；I/O 驱动只需记住：操作手输入和裁判系统数据是它们采集、以话题形式送进来的，`rm_manual` 从不直接读串口。
+本文主要讲**决策核心** `rm_manual` 自己（下面第 2 节起）；I/O 驱动只需记住：操作手输入和裁判系统数据是它们采集、以话题形式送进来的，`rm_manual` 从不直接读串口。各驱动都是独立 ROS 节点，不碰 1kHz 控制环、不直接操作电机。
+
+`rm_referee` 的下行与上行是同一路串口：
+
+- **下行**（接收）：80Hz 轮询 `Base::serial_.read()`，读到原始字节后按裁判系统协议解帧（`0xA5` 帧头 → CRC 校验 → cmd_id 分发 → publish 对应 topic），利用 `unpack_buffer_` 确保跨帧的正确拼接。一旦超过 5 秒收不到数据，置 `referee_data_is_online_ = false`。
+- **上行**（发送）：由 `send_serial_data_timer_` 驱动（默认 150ms 间隔），将 UI 图形、字符、交互数据（按键、哨兵/雷达指令）组帧发回裁判系统客户端。
+
+  裁判系统串口协议的 UI 帧有几种固定规格：一帧可携带 **1 图、2 图、5 图或 7 图**（不同 `cmd_id`），外加单独的字符帧。`sendQueue()` 每拍根据队列积压量选最划算的规格：
+
+  ```
+  队列 ≥7 张 → sendSevenGraph() 一次发 7 张
+  队列 ≥5 张 → sendFiveGraph()  一次发 5 张
+  队列 ≥2 张 → sendDoubleGraph() 一次发 2 张
+  队列 =1 张 → sendSingleGraph() 一次发 1 张
+  队列 ≤14 张且有字符 → sendCharacter() 穿插发一个字符
+  ```
+
+  先发字符还是先发图形有优先级：队列里图形少于 14 张时先处理一个字符（因为字符排队更敏感），否则按上述规格从大到小打包。发完一批后下一拍（150ms）继续处理队列剩余，避免串口拥塞。
+
+注意：这一路串口的物理拓扑是**裁判系统 → 超级电容 → 电脑**，裁判系统和超级电容挂在同一条总线上、共用同一个 tty（`/dev/usbReferee`）。数据天然混在一起，`rm_referee` 按 `cmd_id` 区分：
+
+- 裁判系统的比赛状态、血量、功率/热量等走标准 ID（如 `ROBOT_STATUS_CMD`、`POWER_HEAT_DATA_CMD`）
+- 超级电容的电源管理数据走 `POWER_MANAGEMENT_*` 系列 ID（`POWER_MANAGEMENT_SAMPLE_AND_STATUS_DATA_CMD` 等），解包后 publish 成 `power_management/sample_and_status` 等 topic，供 `ChassisCommandSender` 里的 `PowerLimit` 状态机使用
+
+
 
 `rm_manual` 管的是"**什么时候做、做什么**",不管"算法怎么算":
 
@@ -30,23 +54,36 @@
 它的主循环极简：
 
 ```cpp
-ros::Rate loop_rate(100);           // 100Hz
+ros::Rate loop_rate(100);           // ~100Hz
 while (ros::ok()) {
-  ros::spinOnce();                  // 处理所有 ROS 回调（遥控器、裁判系统、视觉…）
+  ros::spinOnce();                  // 处理 ROS 回调（遥控器、裁判系统、视觉…）
   manual_control->run();            // 执行决策逻辑
   loop_rate.sleep();
 }
 ```
 
-`spinOnce()` 消化掉这一拍收到的所有输入（遥控器数据、裁判系统数据、视觉跟踪数据……），`run()` 做同步决策。`run()` 里干三件事——检查裁判系统、推进控制器切换、推进标定流水线：
+`spinOnce()` 消化掉这一拍收到的所有输入，同时也触发回调中附带的动作——比如 `dbusDataCallback` 末尾会调 `sendCommand()` 把决策打包发往下层。`run()` 做的是不依赖具体输入的同步决策，基类干三件事：
 
 ```cpp
 void ManualBase::run() {
-  checkReferee();                  // 裁判系统状态检查（电源、血量…）
-  controller_manager_.update();    // 执行缓存的控制器开关请求
-  // 子类还会叠加：各 CalibrationQueue.update() 推进标定
+  checkReferee();                  // 裁判系统状态检查（电源事件、online 检测、publish manual_to_referee）
+  ecat_reconnected_event_.update(ecat_bus_is_online_);
+  controller_manager_.update();    // 刷新缓存的控制器开关请求
 }
 ```
+
+标定流水线的推进不在基类 `run()` 里——因为不是所有兵种都有标定控制器。有标定的子类（如英雄）在自己的 `run()` 里加上：
+
+```cpp
+void ChassisGimbalShooterManual::run() {
+  ChassisGimbalManual::run();
+  chassis_calibration_->update(ros::Time::now());
+  shooter_calibration_->update(ros::Time::now());
+  gimbal_calibration_->update(ros::Time::now());
+}
+```
+
+`sendCommand` 则不是放在 `run()` 里统一调，而是挂在了 `dbusDataCallback` 末尾——因为指令发布的时机天然随遥控器输入走，断连时发的就是上一拍的旧值（控制器端有 `timeout` 保护兜底）。效果上两者都是 ~100Hz（遥控器数据就是这个频率），但附着点不同。
 
 下面把这些拆开讲。它内部由四大块组成：**事件引擎（InputEvent）、控制器编排（ControllerManager）、标定流水线（CalibrationQueue）、指令发布（CommandSender）**。
 
@@ -288,7 +325,7 @@ class ShooterCommandSender : ... {
 
 几个最容易踩的坑：
 
-- **每拍都要发，不是"变了才发"**：`sendCommand` 得在 100Hz 主循环里每拍调用。很多控制器有 `timeout` 保护（如 [chassis](./chassis.md)），一旦一段时间收不到指令就当断连、速度归零/急停。只在值变化时发布会触发误急停。
+- **每拍都要发，不是"变了才发"**：`sendCommand` 得在每个决策周期被调用（`rm_manual` 里它挂在 `dbusDataCallback` 末尾，由 `spinOnce` 驱动在 ~100Hz）。很多控制器有 `timeout` 保护（如 [chassis](./chassis.md)），一旦一段时间收不到指令就当断连、速度归零/急停。只在值变化时发布会触发误急停。
 - **要判时效就必须带时间戳**：控制器如果检查指令新鲜度，sender 必须用 `TimeStampCommandSenderBase` 并让 `stamp = ros::Time::now()`，否则控制器会一直认为指令过期而拒绝执行。
 - **话题名一致是头号哑火原因**：sender 配的 `topic` 和控制器订阅的对不上，就静默失联、毫无报错。这和 [hardware](./hardware.md) 里电机名四层一致是同一类坑。
 - **sender 只打包、不写控制逻辑**：闭环、状态机都在控制层。裁判系统约束（功率/热量）可以像 `ChassisCommandSender`/`ShooterCommandSender` 那样内嵌 `PowerLimit`/`heat_limit_` 子模块（§6），但那是"约束指令"，不是"执行指令"。
@@ -304,22 +341,137 @@ class ShooterCommandSender : ... {
 
 ### 6.1 底盘功率管理
 
-[chassis](./chassis.md) 讲过底盘控制器会做功率缩放，但"当前功率上限是多少、现在该充电还是爆发"是决策层给的。`ChassisCommandSender` 内嵌一个 `PowerLimit` 状态机（CHARGE / NORMAL / BURST），根据裁判系统的功率数据和超级电容状态，决定下发的功率上限：
+[chassis](./chassis.md) 讲过底盘控制器会做功率缩放，但"当前功率上限是多少、现在该充电还是爆发"是决策层给的。`ChassisCommandSender` 内嵌一个 `PowerLimit` 状态机，封装在 `rm_common/decision/power_limit.h` 里。
+
+#### 5 种模式
 
 ```cpp
-void ChassisCommandSender::sendCommand(const ros::Time& time) {
-  power_limit_->update();                                   // 读裁判数据算状态
-  if (power_limit_->getState() == PowerLimit::BURST)
-    msg_.power_limit = 100.0;                               // 爆发（按 Shift 冲刺）：满功率
-  else if (power_limit_->getState() == PowerLimit::CHARGE)
-    msg_.power_limit = 0.0;                                 // 充电（按住 B）：给电容让功率
-  else
-    msg_.power_limit = power_limit_->getLimit();            // 正常：裁判系统限值
-  publisher_.publish(msg_);
+typedef enum {
+  CHARGE = 0,  // 充电：优先给超级电容充
+  BURST = 1,   // 爆发：超电放电补功率
+  NORMAL = 2,  // 正常：仅用裁判系统限制功率
+  ALLOFF = 3,  // 超电关闭
+  TEST = 4,
+} Mode;
+```
+
+#### 控制决策树
+
+`setLimitPower()` 的决策逻辑（以英雄/步兵为例，工程直接 400W 不参与）：
+
+```
+裁判系统不在线
+  → safety_power_（安全功率，底盘能动但受限）
+裁判系统在线
+  └─ 超电不在线 或 expect_state_ == ALLOFF
+       → normal()：仅用裁判系统 chassis_power_limit_
+  └─ 超电在线
+       └─ chassis_power_limit_ > burst_power_
+            → burst_power_（裁判限值本身已超爆发上限，直接钳位）
+         └─ 按 expect_state_ 分流
+              ├─ NORMAL → normal()
+              ├─ BURST  → burst(chassis_cmd, is_gyro)
+              ├─ CHARGE → charge()
+              └─ default → zero()（功率=0，底盘动不了）
+```
+
+> **旧超电有什么问题？为什么要换？**
+>
+> 所谓"跳"，是指 NUC 和超电之间完成一次功率控制所需的串口**往返次数**。
+>
+> **旧超电是两跳**：
+>
+> ```
+> 第一跳：NUC → 设模式（CHARGE / BURST / NORMAL）→ 超电
+> 第二跳：超电 → 回报自身状态（cap_state_）→ NUC 读到后才算功率限制
+> ```
+>
+> 软件必须先告诉超电"我要爆发"，等超电执行完了再报告"我现在在爆发状态了"，软件确认后才真的把功率限制提上去。一来一回，中间多一个完整的串口往返延迟。有两个痛点：
+>
+> 1. **响应慢**：急加速时超电反应跟不上节奏。
+> 2. **耦合紧**：功率计算的正确性依赖超电能否正确回报状态——回报丢了或延迟了，功率限制就算错了。
+>
+> **新超电是一跳**：
+>
+> ```
+> NUC 直接设 power_limit → 超电自己管充放电
+> ```
+>
+> 软件不再跟超电协商状态，直接告诉它"功率上限是多少"，超电内部根据这个值自动决定充放电。一跳完成，响应更快、耦合更低。现在的代码已经只有新超电的路径，`is_new_capacitor_` 标志已被移除。
+
+为什么旧超电协议不支持一跳？因为它的固件只懂"模式"不懂"功率"——你只能告诉它"我要爆发"，它不知道应该放多少电，还得报告状态回来让 NUC 算。新超电的固件内部多了一个控制回路，可以直接接受 `power_limit` 值，根据负载自动决定充放电电流。**充放电决策从 NUC 挪到了超电固件里**，NUC 的角色从"协商"变成了"指令"。
+
+#### 三种核心模式
+
+**BURST**——超电放电，底盘获得超出裁判限制的功率：
+
+```cpp
+void burst(rm_msgs::ChassisCmd& chassis_cmd, bool is_gyro) {
+  if (cap_state_ != ALLOFF && cap_energy_ > capacitor_threshold_
+      && chassis_power_buffer_ > power_buffer_threshold_) {
+    if (is_gyro)
+      setGyroPower(chassis_cmd);     // 小陀螺模式，用 gyro_power_
+    else
+      setBurstPower(chassis_cmd);    // 正常爆发，用 burst_power_
+  } else
+    expect_state_ = NORMAL;           // 条件不满足，回落 normal
 }
 ```
 
-这就补上了 [chassis](./chassis.md) 里"超级电容 CHARGE/NORMAL/BURST 状态机由 PowerLimit 管理"那句话的落点。
+`setBurstPower()` 内部还有迟滞保护（`enable_burst_cap_threshold_` / `disable_burst_cap_threshold_`），防止超电容量在阈值附近来回切。`setGyroPower()` 同理，用另一套 `enable_gyro_cap_threshold_` / `disable_gyro_cap_threshold_`。
+
+**CHARGE**——限制底盘功率，给超电让出充电功率：
+
+```cpp
+void charge(rm_msgs::ChassisCmd& chassis_cmd) {
+  allow_use_cap_ = false;
+  chassis_cmd.power_limit = chassis_power_limit_ * 0.70;  // 只给 70% 限制功率
+}
+```
+
+**NORMAL**——仅用裁判系统限制功率，超电不主动介入：
+
+```cpp
+void normal(rm_msgs::ChassisCmd& chassis_cmd) {
+  allow_use_cap_ = false;
+  if (cap_state_ != ALLOFF && cap_energy_ > disable_normal_cap_threshold_
+      && chassis_power_buffer_ > power_buffer_threshold_)
+    chassis_cmd.power_limit = chassis_power_limit_ + extra_power_;
+  else
+    chassis_cmd.power_limit = chassis_power_limit_;
+  if (chassis_cmd.power_limit > max_power_limit_)
+    chassis_cmd.power_limit = max_power_limit_;
+}
+```
+
+注意 normal 模式下的 `extra_power_`：当超电在线且电量充足时，即使 NORMAL 模式也会从超电借少量功率——旧超电用这个参数，新超电设 0 关闭此行为。
+
+#### 上下行路径
+
+**下行（超电 → NUC）**：超电的电源管理数据通过 `POWER_MANAGEMENT_SAMPLE_AND_STATUS_DATA_CMD` 帧经同一路串口发上来，`rm_referee` 解包后 publish 成 `power_management/sample_and_status` topic。`PowerLimit::setCapacityData()` 订阅它，更新各字段：
+
+| 变量 | 含义 |
+| --- | --- |
+| `chassis_power` | 电源管理模块输出功率（W） |
+| `capacity_remain_charge` | 超电剩余容量百分比 |
+| `capacity_discharge_power` | 超电当前放电功率 |
+| `state_machine_running_state` | 超电状态（1 = 开，3 = 关） |
+
+超电在线标志 `capacity_is_online_` 判断：连续 0.3s 收不到数据就置 false。
+
+> 注意：如果串口读不到裁判系统数据，原因之一可能是超电出了问题——因为物理拓扑是**裁判系统 → 超电 → 电脑**，超电断了，裁判系统的数据也过不来。
+
+**上行（NUC → 超电）**：`rm_manual` 发 `ManualToReferee` 消息，`rm_referee` 收到后经 `ChassisTriggerChangeUi` 编码进 UI 图形颜色（白 = NORMAL、绿 = CHARGE、黑 = BURST/ALLOFF），再通过同一串口发给裁判系统客户端，裁判系统转给超电。超电根据图形颜色解析出期望状态。开关超电有 0.2s 防误触延迟。
+
+```
+rm_manual                      rm_referee                         串口
+ChassisCommandSender           referee_base                          |
+  └─ PowerLimit                 └─ manualDataCallBack                |
+       └─ updateState(state)         └─ ChassisTriggerChangeUi       |
+            ManualToReferee ───────►       └─ updateConfig(color)───► 裁判系统 → 超电
+```
+
+这就补上了 [chassis](./chassis.md) 里"超级电容 CHARGE/NORMAL/BURST 状态机由 PowerLimit 管理"那句话的落点，以及背后一整套上下游数据流。
 
 ### 6.2 发射热量管理
 
@@ -413,7 +565,7 @@ rm_manual:
 ## 9. 小结
 
 - **决策层 = 决策核心 `rm_manual` + I/O 驱动 `rm_dbus`/`rm_vt`/`rm_referee`**（全非实时）。驱动采集遥控器/图传/裁判系统 → 话题 → 核心，核心的 UI/反馈也经它们发回；`rm_manual` 本身不读串口。
-- **rm_manual 是决策核心**，跑在 100Hz，不参与 1kHz 控制环，通过 ROS 话题编排下层——管"什么时候做、做什么"。
+- **rm_manual 是决策核心**，跑在约 100Hz 的 `ros::Rate` 循环（`run()` + `spinOnce` 驱动的回调），不参与 1kHz 控制环，通过 ROS 话题编排下层——管"什么时候做、做什么"。
 - **InputEvent** 把遥控器/键盘的电平信号转成上升沿/下降沿/长按等事件，之上还有 PASSIVE/IDLE/RC/PC 顶层状态机，断连即回安全态。
 - **ControllerManager** 按 state / main / calibration 三类生命周期管理控制器，用缓冲 + 异步原子切换避免 joint 冲突竞态。
 - **CalibrationQueue** 编排标定步骤：按顺序"启标定控制器 + 停主控制器 + 轮询完成",上层只需 `reset()` + `update()`；由裁判系统电源/比赛事件触发重标。

@@ -146,7 +146,9 @@ transmission_interface::Transmission          （抽象基类）
 
 ## 4. 标定：让每次上电后关节零点都对得上
 
-前面第 2 节埋了个伏笔：增量式编码器上电不知道自己在哪，需要标定找回零点。这一节把标定讲透。
+> **自动标定是 rm-controls 的一大特色。** 别的框架（如 RMCS、XRobot）通常把零点位置硬编码在 YAML 配置文件里——装车时手动拨到零位、读编码器值、填进 `yaw_motor_zero_point` / `pitch_motor_zero_point` 这类字段，下次换机械结构就得重新量。这种做法的前提是"机械结构终身不变"，但 RoboMaster 的比赛环境是"频繁拆装、可能被撞歪"，硬编码零点一偏整个控制就偏了。
+>
+> rm-controls 的做法是**上电自动标定**：每次启动都让电机自己跑去找参考点，动态算 offset，写入内存。机械变了也不怕——下一次上电自动重新找零。这套机制的核心是下文的 `ActuatorExtraInterface` + `CalibrationQueue` + 标定控制器三层配合。
 
 ### 4.1 标定的本质
 

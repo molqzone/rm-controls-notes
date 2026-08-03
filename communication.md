@@ -106,43 +106,65 @@ EtherCAT（Ethernet for Control Automation Technology）是 Beckhoff 提出的�
 
 一句话：**EtherCAT 用大得多的带宽、亚微秒的同步、以及"一帧承载所有外设"的能力，一次性解决了 CAN 的带宽、同步、扩展三个痛点。** 队内现在已经不再走 Linux-to-CAN 的老路，只用 `rm_ecat_hw`。
 
-不过 EtherCAT 也不是白拿好处——它引入了一个新麻烦：**通信时序变得很严格**。这就是下一节要讲的双线程设计的由来。
+不过 EtherCAT 也不是白拿好处——它引入了一个新矛盾：**ROS 不配跑在 EtherCAT 的实时路径上**。这就是下一节要讲的拆线程设计的由来。
 
 ---
 
-## 5. 双线程：EtherCAT 带来的新问题与解法
-
 ### 5.1 矛盾
 
-EtherCAT 主站（rm-controls 用的是 SOEM，Simple Open EtherCAT Master 库）要求"发一帧 → 等接收 → 解析反馈 → 组装下一帧"必须在**固定的 1kHz 周期**内严丝合缝地完成，不能等控制器慢慢算。但控制器的计算时间是**不确定**的——大多数时候几十微秒，偶尔碰上弹道解算这种重活可能冲到几百微秒。
+EtherCAT 主站（rm-controls 用的是 SOEM，Simple Open EtherCAT Master 库）要求"发一帧 → 等接收 → 解析反馈 → 组装下一帧"需要在**固定的 1kHz 周期**内完成。但如果把控制计算也塞进这个周期，问题就来了：问题不在控制计算本身（算一个 PID 其实只要几微秒），而在**ROS 操作不可预测**。
+
+`controllerManager::update()` 内部和 `write()` 里藏着三件不可控的事：
+
+1. **ROS 消息的内存分配与序列化**：`write()` 里会 `publish()` GPIO 状态、总线状态等 ROS 消息。尽管用了 `ThreadedPublisher` 把网络发送卸到后台，但 `publish()` 本身仍涉及消息内存分配、序列化、加锁写入 publisher 队列——都可能有几十到几百微秒的突发延迟。
+2. **Controller Manager 内部调 ROS**：`controllerManager_->update()` 除了跑控制器，还会在 controller 加载/卸载时触发 ROS service 回调。某些 controller 的 `update()` 也会 publish debug topic。这些 ROS 操作内部隐含着 `AsyncSpinner`、`TopicManager` 等全局锁的争用。
+3. **动态调度不可控**：`std::thread` 和 ROS 的线程池共享 CPU 时间。即使 `SCHED_FIFO` 设了高优先级，一次 page fault（ROS 消息首次分配）、一次系统调用（`ros::Time::now()`）、一次内核抢占——都可能在毫秒级路径上插入不可控的延迟。
 
 如果像 CAN 方案那样塞进一个线程里顺序执行：
 
 ```
-read() → controllerA::update() → controllerB::update() → write()
-│         ├── 可能 200~800μs 抖动 ──┤                        │
-└──────────────── 总时间不固定，write() 可能迟到 ────────────┘
+readAllBuses() → updateProcessReadings() → controllerManager::update() → updateSendStagedCommands() → writeToAllBuses()
+│                    ← 可能插入 ROS 操作 ──→                    │              │
+└────────── SOEM 帧收发也被拖住 ────────────────→              EtherCAT 帧错过 DC 窗口 ──→ 总线掉线
 ```
 
-控制器这一拍算久了，`write()` 就迟到，EtherCAT 帧错过了它该发的时刻，总线同步就丢了。
+关键是：**这不是"控制器算太久"的问题**——控制器本身的纯数学运算只占几百微秒，1kHz 周期完全兜得住。问题在于 ROS 操作插进来的那一刻，你没法控制它花多久。而在 EtherCAT 上，这一帧的收发必须锁在 DC 分布式时钟的同步窗口内，错过就 watchdog 超时。
 
-### 5.2 解法：拆成两个线程，用缓冲区解耦
+所以矛盾的本质是：**CAN 能容忍随机抖动（内核缓冲区兜底），EtherCAT 连几十微秒的不可控抖动都不允许出现在通信路径上**。
 
-`rm_ecat_hw` 的核心设计决策是把循环拆成两个线程：
+### 5.2 解法：拆成两个线程，隔离 ROS 抖动
+
+解法不是"让控制器算快点"——它本来就够快。解法是把**一段代码拆成两条路径，把 ROS 关在 EtherCAT 的门外**。
+
+`rm_ecat_hw` 拆成两个线程，中间用双缓冲队列隔离：
 
 ```
-控制线程（controlWorker）          双缓冲队列（加锁保护）        EtherCAT 线程（updateWorker）
-────────────────────              ──────────────────         ────────────────────────
-计算时间可抖动                                                 严格固定 1kHz
-1. read()  从缓冲读上一拍反馈  ◄──────  reading_  ◄──────────  收到帧后写入反馈
-2. controllerManager.update()                                
-3. write() 把命令写入缓冲       ──────►  stagedCommand_  ────►  下一拍取走、组帧发送
+EtherCAT 线程（updateWorker，严格 1kHz）       控制线程（controlWorker，可抖动）
+───────────────────────────────              ────────────────────────
+只做最干净的四步，没有任何 ROS 调用：           允许 ROS 操作，爱抖多久抖多久：
+1. readAllBuses()（SOEM 收帧）                1. read()（从 reading_ 拷反馈，纯 double 赋值）
+2. updateProcessReadings()（解析 TxPDO）      2. controllerManager::update()（可能含 ROS）
+3. updateSendStagedCommands()（组装 RxPDO）   3. write()（propagate + 限幅 + stageCommand，可能 publish）
+4. writeToAllBuses()（SOEM 发帧）
+         ▲                              ▲
+         │        双缓冲队列（加锁）        │
+         │    ┌──────────────────┐        │
+         ├────┤  reading_（反馈）  ├────────┤
+         │    │  ← EtherCAT 写入  │  控制线 │
+         │    │  → 控制线程读取    │  程读取 │
+         │    ├──────────────────┤        │
+         │    │ stagedCommand_    │        │
+         │    │  ← 控制线程写入    │  控制线 │
+         └────┤  → EtherCAT 读取  ├────────┘
+              └──────────────────┘
 ```
 
-- **控制线程**不受严格时序约束，允许偶尔超时；它只管从缓冲区拿最新反馈、算、把命令丢进缓冲区
-- **EtherCAT 线程**雷打不动地按 1kHz 收发帧；它从缓冲区取走上一拍的命令去发，把收到的反馈写进缓冲区
+- **EtherCAT 线程**只干四件事——纯 C++ 数组拷贝 + SOEM 收发，不做任何 ROS 操作、不分配内存、不碰 ROS 锁。总耗时固定在几十微秒，1kHz 雷打不动。
+- **控制线程**管 ROS control 的全套流程，包括 controller 计算和 ROS publish。它跑多快都无所谓，EtherCAT 线程读到的只是旧一拍的命令。
 
-两个线程通过两块加锁的缓冲区（`stagedCommand_` 命令缓冲、`reading_` 反馈缓冲）交接数据。代价是多引入了**一个周期的延迟**（平均约 500μs）——这是用一点点延迟换取通信时序的绝对稳定，非常划算。
+两个线程通过每块从站内部的两块加锁缓冲区交接数据（`stagedCommandMutex_` / `readingMutex_`，见 `RmEcatSlave.h`）。
+
+代价是引入**一个周期的延迟**（控制线程算完的命令，要等下一拍 EtherCAT 线程才发出去，平均约 500μs）——这是用一点点延迟换取确定性，非常划算。
 
 ---
 
@@ -280,23 +302,26 @@ Slave 按电机协议分两种：
 
 它只管 EtherCAT 帧的物理收发和总线健康，完全不知道上面跑的是电机、IMU 还是 GPIO——业务无关。
 
-### 7.4 两个 worker 线程怎么用这几个类
+### 7.4 三个 worker 线程怎么用这几个类
 
-第 5 节讲的双线程，落到类上就是两个 worker 函数，各自调用上面的类：
+第 5 节讲的拆线程设计，落到类上就是三个 worker 函数，各自调用上面的类：
 
 ```
-控制线程 controlWorker（计算可抖动）      EtherCAT 线程 updateWorker（严格 1kHz）
-──────────────────────────              ──────────────────────────────
-1. RmEcatHW::read()                      1. EcatBusManager::readAllBuses()
-     从 reading_ 缓冲取上一拍反馈              SOEM 发帧+收帧
-2. controllerManager.update()            2. SlaveManager::updateProcessReadings()
-     各控制器算命令                            slave->updateRead() 解析 TxPdo → reading_
-3. RmEcatHW::write()                      3. SlaveManager::updateSendStagedCommands()
-     → SlaveManager::stageMotorCommands()      slave->updateWrite() 从 stagedCommand_ 组 RxPdo
-       写进 stagedCommand_ 缓冲            4. EcatBusManager::writeToAllBuses() 发帧
+EtherCAT 线程 updateWorker（严格 1kHz）    控制线程 controlWorker（可抖动）     发布线程 publishWorker（~100Hz）
+──────────────────────────────           ──────────────────────           ──────────────────────────────
+1. EcatBusManager::readAllBuses()        1. RmEcatHW::read()               1. SlaveManager::sendRos()
+     SOEM 发帧+收帧                          从 reading_ 取反馈                 把 readings / imu / jointState
+2. SlaveManager::updateProcessReadings() 2. controllerManager.update()        publish 成 ROS topic
+     slave->updateRead()                     各控制器算命令
+     解析 TxPdo → reading_               3. RmEcatHW::write()
+3. SlaveManager::updateSendStagedCommands()   → stageMotorCommands()
+     slave->updateWrite()                     写进 stagedCommand_
+     从 stagedCommand_ 组 RxPdo
+4. EcatBusManager::writeToAllBuses()
+     发帧
 ```
 
-两块加锁缓冲区把两个线程解耦：
+两块加锁缓冲区把通信线程和控制线程解耦：
 
 | 缓冲区 | 锁 | 控制线程 | EtherCAT 线程 |
 | --- | --- | --- | --- |
@@ -315,7 +340,7 @@ Slave 按电机协议分两种：
 - 电脑和电机语言不通，中间必须有**协议 + 转发硬件 + 物理链路**三样东西，通信协议约定了双方的"话术"。
 - **CAN** 是 RoboMaster 电机原生的总线，简单可靠，但带宽（1 Mbit/s、8 字节）、同步、扩展三方面都吃紧。
 - **EtherCAT** 用普通网线跑工业实时以太网，带宽大得多，靠分布式时钟做到亚微秒同步，还能把电机、IMU、遥控器、GPIO 全塞进一帧——CAN 被下沉到从站板内部。
-- 迁移到 EtherCAT 的代价是通信时序变严格，`rm_ecat_hw` 用**双线程 + 缓冲区**解耦通信与计算来应对，代价是约一个周期的延迟。
+- 迁移到 EtherCAT 的代价是通信路径上不允许抖动，`rm_ecat_hw` 用**三线程（通信 + 控制 + 发布）+ 双缓冲**把 ROS 的不可预测性隔离出 EtherCAT 关键路径来应对，代价是约一个周期的延迟。
 - 无论走 CAN 还是 EtherCAT，差异都被封在硬件抽象层的 `RobotHW` 实现里，控制层和决策层完全无感。
 
 下一站 [hardware](./hardware.md)：链路终点的电机长什么样、编码器怎么知道自己转到哪了、Transmission 怎么在关节和电机之间做翻译，以及每次上电为什么都要标定。
