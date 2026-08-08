@@ -23,6 +23,7 @@ ARTICLES=(
   overview.md
   communication.md
   hardware.md
+  control.md
   transform.md
   chassis.md
   gimbal.md

@@ -1,206 +1,86 @@
-# rm-controls-notes 文档规划草案
+# rm-controls-notes 文档结构
 
-> **背景**：`01-~09-` 目录下的旧文档已 deprecated。`rm-controls-notes/` 是从零开始重写的文档集，目标读者是**完全没有调车经验的新人**。
+> **状态**：本目录的核心文档已经完成，并按 `D:\DynamicX\rm_ws` 当前实现复核。目标读者是没有调车经验的新人。
 
 ---
 
 ## 核心理念
 
-- **按业务领域组织**，不按软件组件（controller）组织
-- 文档名 = 业务领域：`chassis.md`、`gimbal.md`、`shooter.md`
-- **每篇文档回答一组递进的问题**，新人按顺序读就能建立起完整的心智模型
-- **不假设读者有任何前置知识**
-- **依赖关系单向**：overview → communication → hardware → transform → domain docs
+- **按业务领域组织**，不按 controller 包名组织。
+- 文档名对应读者要解决的问题：`chassis.md`、`gimbal.md`、`shooter.md`、`manual.md`。
+- 从系统结构、通信和硬件基础出发，再进入控制、坐标变换和具体机构。
+- 现有实现、配置快照和后续建议必须明确区分；不能把设计建议或外部固件行为写成当前源码功能。
 
 ---
 
-## 建议的文档清单
+## 文档清单
 
-### 1. overview.md ✅（已有，需确认是否适配零基础）
+### 1. overview.md
 
-**职责**：新人读完后能回答"这套系统长什么样、分几层、每层管什么"。
+**职责**：建立三层架构、机构与控制器的整体心智模型。
 
-覆盖：
+覆盖无下位机架构、决策层/控制层/硬件抽象层分工、底盘/云台/发射机构与常用控制器。
 
-- 什么是无下位机（不用 MCU 写控制算法）
-- 系统三层架构的轮廓（决策层/控制层/硬件抽象层）
-- **从机械机构到控制器**：机器人分几个机构（底盘/云台/发射）→ 每个机构对应一个控制器 → 控制器之间互不干扰
-- 9 个控制器一句话简介
-- 硬件抽象层做了什么（和硬件通信、统一接口）
+### 2. communication.md
 
-**不覆盖**：
+**职责**：讲清电脑与设备间的 CAN、EtherCAT 链路，以及 `rm_hw` 和 `rm_ecat_hw` 的边界。
 
-- Transmission、offset、标定（放 hardware.md）
-- 各业务领域的算法细节（放 chassis.md / gimbal.md / shooter.md）
+覆盖 CAN/CAN FD、EtherCAT 从站与分布式时钟、两种硬件路径的启动配置和通信数据流。
 
----
+### 3. hardware.md
 
-### 2. communication.md（待写）
+**职责**：讲清电机、编码器、Transmission 与标定。
 
-**职责**：讲清楚"电脑和电机之间怎么通信"。
+覆盖 RoboMaster 电机与反馈、单圈角和机械零点、`SimpleTransmission`、`DifferentialTransmission`、`MultiActuatorTransmission`，以及 `need_calibration`、运行时 offset 和标定编排。
 
-覆盖：
+### 4. control.md
 
-- 为什么需要通信协议（电脑不是直接连电机的）
-- CAN 总线：历史、特点、CAN ID、CAN FD
-- EtherCAT：什么是 EtherCAT、从站拓扑、分布式时钟
-- rm-controls 为什么从 CAN 迁移到 EtherCAT（带宽、稳定性）
-- 通信链路全景：上位机 → 网卡 → EtherCAT 从站板 → 电机
-- 硬件抽象层如何封装通信差异（rm_hw vs rm_ecat_hw）
+**职责**：讲清所有机构共享的闭环控制基础。
 
-**不覆盖**：
-- 具体电机的控制协议（放 hardware.md）
-- Transmission 和标定（放 hardware.md）
+覆盖 PID、串级环、前馈、限幅与 anti-windup、状态切换、命令规划和可复现的调参流程。它不代替各机构文档中的具体控制器行为。
 
-**前置知识**：overview
+### 5. transform.md
 
----
+**职责**：讲清 TF、URDF 关节树和控制器如何查询坐标变换。
 
-### 3. hardware.md（待写）
+覆盖坐标系树、`robot_state_controller`、IMU 姿态和控制器消费 TF。当前 `robot_state_controller` 使用标准 `tf2_ros::Buffer`；`RobotStateInterface` / `RobotStateHandle` 只是保存并转发该 Buffer 指针的硬件接口，不能因此宣称它无锁或具有硬实时保证。
 
-**职责**：硬件相关的所有内容——电机、传感器、Transmission、标定，一篇讲完。
+### 6. chassis.md
 
-覆盖（按阅读顺序）：
+**职责**：讲清底盘轮系、运动学、FOLLOW、里程计和功率约束。
 
-1. **RoboMaster 常用电机**：3508/6020/2006/达妙，力矩/速度/位置控制模式
-2. **编码器**：增量式 vs 绝对式，为什么增量式每次上电不知道自己在哪
-3. **Transmission**：为什么需要它（关节弧度 ↔ 电机值的翻译层）
-   - SimpleTransmission：减速比、offset、负减速比=反装
-   - DifferentialTransmission：差速器
-   - DualActuatorTransmission：双电机带一个关节
-5. **标定**（紧接 offset 讲）：
-   - 为什么需要标定（承接编码器部分）
-   - 标定的本质：找零 → 算 offset → 存 offset → 标记完成
-   - 状态流转：needCalibration → calibrating → calibrated
-   - 三种标定方式：撞限位、读 Hall、差动
-   - 标定时硬件层跳过限幅、自动应用 offset
-   - 标定编排：多个机构按顺序标，一个标完再标下一个
-   - **calibration_controller 的实现**：如何继承 MultiInterfaceController、如何 claim/release joint、如何检测堵转
-   - 为什么标定时其他机构还能动（引用 overview 的独立启停概念）
-6. **其他硬件**（按需）：IMU、裁判系统、GPIO、ToF 雷达
+### 7. gimbal.md
 
-**不覆盖**：
-- 底盘运动学、云台 PID、发射状态机（放各自的 domain doc）
-- TF 相关（放 transform.md）
+**职责**：讲清云台轴、串级控制、重力补偿、弹道解算和视觉跟踪。
 
-**前置知识**：overview 中的"硬件抽象层"概念
+### 8. shooter.md
+
+**职责**：讲清摩擦轮、拨盘状态机、卡弹检测、射出检测和热量约束。
+
+### 9. manual.md
+
+**职责**：讲清 `rm_manual` 如何把输入事件、控制器切换、标定流水线、指令发布和裁判数据编排起来。
 
 ---
 
-### 4. transform.md（待写）
-
-**职责**：讲清楚 TF 是什么、rm-controls 怎么处理 TF。
-
-覆盖：
-- TF 是什么（给零基础新人的最小介绍：坐标系树、父子变换）
-- URDF 关节树怎么变成 TF 发布出来——`robot_state_controller` 的职责
-- IMU 数据怎么变成 TF——`orientation_controller` 的职责
-- rm-controls 为什么不用标准 `tf2_ros::Buffer`：实时线程安全问题 → `RobotStateInterface` 的设计
-- 其他控制器怎么消费 TF（查坐标系变换）
-- 配置项说明
-
-**不覆盖**：
-- 坐标变换的数学原理（旋转矩阵/四元数，需要的话单独讲）
-
-**前置知识**：overview（理解三层架构）+ hardware.md（理解 joint）
-
----
-
-### 5. chassis.md（待写）
-
-**职责**：讲清楚"底盘是怎么动起来的"。
-
-覆盖：
-- 机器人有哪些轮系：麦轮、舵轮、全向轮
-- 每种轮系的运动学解算（轮子转速 ↔ 底盘速度）
-- 功率限制：裁判系统限制总功率，控制器怎么分配
-- FOLLOW 模式：底盘自动跟随云台方向
-- 里程计
-- 配置项说明
-
-**前置知识**：overview + hardware.md
-
----
-
-### 6. gimbal.md（待写）
-
-**职责**：讲清楚"云台是怎么瞄准的"。
-
-覆盖：
-- yaw/pitch 双轴结构
-- 串级 PID（角度环 → 速度环 → 力矩）
-- 重力补偿
-- 弹道解算（子弹下落补偿）
-- 自瞄模式：接收视觉数据 → 云台跟踪目标
-- 底盘前馈：底盘运动时云台保持指向
-- 配置项说明
-
-**前置知识**：overview + hardware.md
-
----
-
-### 7. shooter.md（待写）
-
-**职责**：讲清楚"子弹是怎么打出去的"。
-
-覆盖：
-- 发射机构组成：摩擦轮 + 拨弹盘
-- 发射状态机：STOP → READY → PUSH → BLOCK
-- 摩擦轮转速控制
-- 卡弹检测
-- 热量限制（裁判系统）
-- 配置项说明
-
-**前置知识**：overview + hardware.md
-
----
-
-### 8. manual.md（待写）
-
-**职责**：讲清楚"上层怎么编排下层"。
-
-覆盖：
-- rm_manual 的定位：决策层，不参与 1kHz 控制环，跑在 100Hz
-- 遥控器/键盘输入怎么变成事件：`InputEvent`、上升沿/下降沿
-- 怎么切换控制器：`ControllerManager` 的 state/main/calibration 三类生命周期
-- 标定流水线：`CalibrationQueue` 编排标定步骤
-- 指令发布：`CommandSender` 构建并发布控制指令
-- 兵种差异如何体现：Manual 继承体系（ChassisGimbalManual / EngineerManual / DroneManual……）
-- 裁判系统交互：功率/热量管理
-- 配置项说明
-
-**不覆盖**：
-- 各 Manual 子类的代码细节
-
-**前置知识**：overview + hardware.md + chassis.md / gimbal.md / shooter.md
-
----
-
-## 依赖关系
+## 阅读依赖
 
 ```
-overview.md                ← 新人第一站，零前置知识
-    │
-    ├── communication.md   ← 需要 overview
-    │
-    ├── hardware.md        ← 需要 communication.md 理解通信方式
-    │                        需要 overview 的"硬件抽象层"概念
-    │
-    ├── transform.md       ← 需要 hardware.md 理解 joint
-    │
-    ├── chassis.md         ← 需要 hardware.md + transform.md
-    ├── gimbal.md           ← 同上
-    ├── shooter.md         ← 同上
-    │
-    └── manual.md          ← 需要 chassis.md + gimbal.md + shooter.md
-                              理解下层再讲上层编排
+overview.md
+  ├── communication.md
+  │     └── hardware.md
+  │           ├── control.md
+  │           └── transform.md
+  │                 ├── chassis.md   （还需要 control）
+  │                 └── gimbal.md    （还需要 control）
+  │           └── shooter.md         （还需要 control）
+  └── manual.md                       （需要 chassis / gimbal / shooter）
 ```
+
+`manual.md` 同时依赖硬件和控制概念；阅读三个机构文档后再看它，能把上层的状态、指令和反馈放回具体机构中理解。
 
 ---
 
-## 和旧文档（01-~09-）的关系
+## 旧文档
 
-全部 deprecated。新的 `rm-controls-notes/` 逐步覆盖旧文档的内容，但：
-- **组织形式不同**：旧文档按目录编号分（代码框架/EtherCAT/电机/控制理论…），新文档按业务领域分（底盘/云台/发射）
-- **深度不同**：旧文档偏操作参考，新文档偏原理
-- **部分内容可以直接搬运**：`software_framework.md` 中的 Transmission 三种类型、`why_rm-controls.md` 中的理念
+`01-~09-` 目录中的旧文档已 deprecated。新文档不沿用其编号式组织，而按业务领域和学习依赖组织；可复用原理时仍需以当前源码、URDF 和配置为准。
