@@ -6,40 +6,41 @@ rm-controls 是一套面向 RoboMaster 机器人的完整控制系统框架，�
 
 ### 1.1 什么是实时性
 
-电机要平稳转动，需要电机内部的控制器（RoboMaster 里叫"电调"，C620 / C610 这类）**定时**收到力矩指令。不是"有空发一下"，而是**每 1ms 必须来一个新的目标值**。如果这拍没发出去，电调就按上一拍的旧值继续跑——少发一拍底盘开始抖，少发几拍电机直接啸叫。
+电机要平稳转动，需要电机内部的控制器（RoboMaster 里叫“电调”，C620 / C610 这类）**定时**收到力矩或电流参考。rm-controls 的标称控制周期是 1ms（1kHz），每份新命令都应在下一截止时间前产生。偶发超期会增加闭环延迟，持续超期则可能让电调反复执行旧命令、使机构失稳；具体电调是否自带超时停机，取决于它的协议与固件，不能假定旧命令永远安全。
 
-怎么保证每 1ms 都准时发出？关键不在算得快，在**确定性**：控制回路从"读编码器"到"发力矩"的耗时必须固定，不能这周期 400μs 下周期 900μs。因为下个周期的启动时刻是定死的，如果这拍算太久，下一拍的力矩就迟到了。
+怎么尽量保证每个周期按时完成？关键不只在平均算得快，还在**最坏情况有界**：控制回路从“读编码器”到“发力矩”的延迟和抖动要有可验证上界，并且要为超期定义降级行为。平均 100μs 但偶尔卡 5ms 的循环，不如稳定在 400μs 的循环可控。
 
-这才是机器人控制里说的**实时性**——不是"反应快"，是"每个周期的时间偏差控制在几十微秒以内"。
+这才是机器人控制里说的**实时性**——不是“反应快”的同义词，而是关键任务能在截止时间内完成，超期能被检测并安全处理。允许的抖动取决于总线、执行器和闭环带宽，不是所有机构都固定为“几十微秒”。
 
 ### 1.2 传统方案怎么满足
 
-STM32 这类 MCU 之所以被选作下位机，就是因为它能满足这个要求：没有操作系统调度抖动，定时器中断的响应时间确定，从中断触发到读取编码器、跑完 PID、输出 PWM 的耗时几乎是常数。
+STM32 这类 MCU 常被选作下位机，是因为任务少、内存和中断路径可控，更容易把最坏响应时间做小并测出来。它并非“没有抖动”：中断优先级、临界区、DMA 争用和缓存都会带来延迟，只是通常比通用 Linux 更容易给出上界。
 
 所以典型的 RoboMaster 软件架构是**上位机 + 下位机**：
 
-- **下位机**（STM32）：跑 1kHz 控制环，读编码器、算 PID、发 PWM，保证每拍准时
+- **下位机**（STM32）：跑机构位置/速度环和状态机，经 CAN 给 C620/C610/GM6020 等电调发送电流或电压参考；换相、PWM 和内电流环仍由电调完成
 - **上位机**（NUC）：跑 ROS、视觉、导航、决策——这些任务不在乎几十微秒的抖动，偶尔卡一帧也没关系
 
 ### 1.3 rm-controls 的做法
 
 传统的 MCU 下位机有一个致命的开发痛点：**改一行代码就要烧录一次固件**。调个 PID 参数、改个标定逻辑、加个调试输出——都要编译、下载、重启，一次几分钟。而 RAM 和 Flash 有限，跑不了复杂算法，也存不了长时间的调试日志。
 
-rm-controls 的解法很直接：**既然上位机算力富余，为什么不让上位机把控制算法也干了？** 于是它做了件激进的事——**把下位机砍了。** 所有控制逻辑全部搬到上位机（NUC），下位机退化成一个透明转发层，只负责把上位机算好的命令转成 EtherCAT 帧发给电机，把电机反馈原样传回上位机，自己不做任何控制计算。
+rm-controls 的解法很直接：**既然上位机算力富余，为什么不让上位机完成机构控制？** 它移除的是队伍自研 MCU 上的位置环、速度环和业务状态机，把这些逻辑搬到 NUC。嵌入式控制并没有从系统中消失：EtherCAT 从站仍做协议转换、收发缓存和链路保护，电调仍做换相、PWM 与内部电流环。“无下位机”更准确地说是**没有承载机构控制算法的自研 MCU 下位机**。
 
 这显然有个矛盾：上位机跑的是 Linux，天然有调度抖动，怎么保证 1kHz 的确定性？
 
 答案是引入一个关键设计思想——**异步解耦**。不是把实时和非实时硬塞进同一个线程里排队等（同步），而是让它们**各跑各的线程，中间用缓冲区异步交接**。这是 rm-controls 整个架构最核心的设计决策：
 
-- **实时路径**（EtherCAT 线程）：只做最干净的事——SOEM 收发 + PDO 数组拷贝，不做任何 ROS 操作、不分配内存、不碰 ROS 锁，总耗时几十微秒。1kHz 雷打不动。
-- **非实时路径**（控制线程）：跑 ROS control 的 `controllerManager::update()`、控制器计算、ROS publish——爱抖多久抖多久，不影响 EtherCAT 的时序。
-- **异步交接**：控制线程把算好的命令写进 `stagedCommand_` 缓冲区就走，EtherCAT 线程下个周期来取。控制线程迟了一拍，EtherCAT 线程读到的是旧数据——但它**永远不迟到**。
+- **通信关键路径**（EtherCAT 线程）：只做 SOEM 收发与 PDO 数据搬运，不在路径中同步做 ROS 发布或日志 I/O，目标是稳定按 1kHz 运行。
+- **控制路径**（controlWorker）：跑 ROS control 的 `controllerManager::update()` 和控制器计算。它可以比通信线程有更大抖动，但仍有自己的时限；卡住后通信线程只会重复旧命令，不会自动变安全。
+- **降频发布路径**（publishWorker）：从快照发布诊断话题，把序列化和网络发送移出通信关键路径。
+- **异步交接**：反馈与命令通过缓冲区跨线程传递，代价是约一个周期延迟。每份命令还应有时间戳或序号；超过新鲜度阈值时要清零/失能或受控保持，并清理相关积分，恢复时从当前状态平滑接回。
 
-这就是 [communication](./communication.md) 里双缓冲 + 双线程设计的核心动机。异步解耦这个思路贯穿整个 rm-controls：决策层跑 ~100Hz 通过 ROS 话题异步通知控制层，控制层 1kHz 算完通过缓冲区异步交接给 EtherCAT 线程——每一层都只用异步接口跟相邻层说话，不强求对方跟自己同一个节拍。
+这就是 [communication](./communication.md) 里双缓冲和线程隔离的核心动机。异步解耦贯穿整个 rm-controls：决策层跑 ~100Hz，通过 ROS 话题通知控制层；控制层按 1kHz 目标周期计算，再通过缓冲区交接给 EtherCAT 线程。每一层不强求相邻层和自己同一个节拍，但都必须检查输入新鲜度。
 
 除了实时性方面的收益，把所有控制逻辑集中到上位机还带来一些额外优势：
 
-- **Sim2real 无缝衔接**：控制算法在上位机运行，可直接在 Gazebo、Unity 等仿真器中以完全相同的代码进行调试和验证，大幅降低场地与硬件成本
+- **Sim2real 代码高度复用**：控制器可在 Gazebo、Unity 等仿真器中复用并提前验证；实车仍要重新面对通信延迟、量化、饱和、摩擦、固件模式和安全限制
 - **实时可视化与调参**：所有 ROS topic 可通过局域网实时转发，配合 PlotJuggler、rqt 等工具动态观察控制曲线、在线调整参数
 - **迭代速度提升**：修改控制算法无需烧录固件，重启节点即可生效，调试周期缩短
 
@@ -64,12 +65,12 @@ rm-controls 的解法很直接：**既然上位机算力富余，为什么不让
   </actuator>
   <joint name="trigger_joint">
     <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
-    <offset>355</offset>   <!-- ← 调这个值，范围 0 ~ 7 rad -->
+    <offset>3.55</offset>  <!-- 示例：单位 rad，实际值必须按机构标定 -->
   </joint>
 </transmission>
 ```
 
-调法是每 1 rad 试一次，找到大概范围后再微调百分位，连续打 50 发验证。全程不需要动一行 C++。
+`SimpleTransmission` 的 offset 单位是 rad；若看到 `355` 这类明显超出单圈的值，应先核对是否漏了小数点或用错了自定义字段，不能照抄。调法可以先按较大步长寻找弹位，再缩小到百分位，并用连续发射验证。全程不需要动一行 C++。
 
 ### 2.2 调云台 pitch 的重力补偿
 
@@ -79,12 +80,12 @@ rm-controls 的解法很直接：**既然上位机算力富余，为什么不让
 # rm_controllers/hero.yaml
 gimbal_controller:
   feedforward:
-    gravity: 6.725                    # ← 重力矩补偿值
-    enable_gravity_compensation: false
-    mass_origin: [0185, 0, 01]  # ← 质心位置
+    gravity: -1.944                         # 重力前馈系数
+    enable_gravity_compensation: true
+    mass_origin: [0.06662, -0.012383, 0.038901]  # 质心位置
 ```
 
-把 PID 临时置零，松手观察：云台往下掉 → 加大 `gravity`；往上抬 → 减小 `gravity`。几分钟就能调好，而不需要改下位机代码来加一个重力补偿项。
+调参时先用机械工装或手托住云台，保留低增益稳定环并设置保守的力矩、速度和关节限位；逐步增加补偿，观察稳定后 PID 还需要输出多少力矩。最好在多个 pitch 角采样并拟合质心参数，最后覆盖完整角域验证。不要把全部 PID 清零后直接松手，重云台会下坠撞限位。整个过程只改 YAML，不需要改下位机代码；完整方法见 [gimbal](./gimbal.md) §3.2。
 
 ## 3 架构
 
@@ -127,7 +128,7 @@ TODO: joint+link only 的 robomaster 机器人
 
 控制层解决的核心问题：ROS control 的标准 controller 只提供一个空的 `update()` 回调和几个 `JointHandle`，但 RoboMaster 需要复杂的控制算法和状态机。
 
-控制层运行在 **1kHz 实时循环**中（与硬件层同线程），通过 `hardware_interface` 的 C++ 指针直通读写硬件数据，不走 ROS 话题序列化。
+当前 EtherCAT 实现中，控制器运行在独立的 `controlWorker`（目标周期 1ms）里：每拍执行 **`read() → controllerManager_->update() → write()`**。EtherCAT 收发位于另一个 `updateWorker`，两者通过从站的 staged command / reading 缓冲区交接数据；控制器仍通过 `hardware_interface` 的 C++ 句柄读写，不走 ROS 话题序列化。
 
 #### 3.2.1 运动控制
 
@@ -157,7 +158,7 @@ TODO: joint+link only 的 robomaster 机器人
 
 | 控制器 | 解决什么问题 |
 | --- | --- |
-| `calibration_controllers` | 增量式编码器电机的自动找零：撞限位 → 检测堵转 → 设 offset → 标记完成 |
+| `calibration_controllers` | 需要机械零点的关节自动找零：撞限位/Hall → 设运行时 offset → 标记完成 |
 | `gpio_controller` | 读取 GPIO 输入（如霍尔传感器）触发标定，输出 GPIO 命令（如电磁铁） |
 
 #### 3.2.3 状态发布
@@ -166,7 +167,7 @@ TODO: joint+link only 的 robomaster 机器人
 
 | 控制器 | 解决什么问题 |
 | --- | --- |
-| `robot_state_controller` | 把 URDF 关节树发布成 TF，操作 `RobotStateInterface` 供其他控制器实时查询 |
+| `robot_state_controller` | 把 URDF 关节树发布成 TF，并通过 `RobotStateInterface` 提供共享查询入口 |
 | `orientation_controller` | 把 IMU 数据发布成 TF，供底盘里程计和云台坐标系使用 |
 | `tof_radar_controller` | 读取 ToF 测距传感器数据并发布 |
 
@@ -211,7 +212,7 @@ class MechanicalCalibrationController
 
 硬件抽象层解决的核心问题：ROS control 的标准 `hardware_interface` 只认识 `JointState` 和 `EffortJoint`，但 RoboMaster 的硬件有大量特殊需求——电机有不同的类型（RM6020 / M3508 / M2006 / 达妙）、有标定状态需要管理、有 GPIO 和 IMU 等非关节外设。通信层面，所有电机使用 CAN 协议，`rm_ecat_hw` 通过 EtherCAT 转发 CAN 数据，不直接与电机通信。
 
-硬件抽象层由 `rm_ecat_hw` 包实现，继承 ROS control 的 `RobotHW` 基类，运行在 **1kHz** 循环中（与控制层同线程或独立线程）。
+当前 `rm_ecat_hw` 节点由 `rm_ecat_ros::RmEcatHardwareInterface` 实现，继承 ROS control 的 `RobotHW`。它启动两个目标周期为 **1ms** 的 worker：`updateWorker` 负责 EtherCAT 收发，`controlWorker` 负责 ROS control 的 read-update-write；另有约 100Hz 的 `publishWorker` 做 ROS 发布。
 
 它做了三件事：
 
@@ -219,35 +220,35 @@ class MechanicalCalibrationController
 
 `rm_ecat_hw` 负责 EtherCAT 帧的收发——管理从站拓扑（哪块板、什么协议、挂在哪张网卡上），把 `RmMotor` / `MitMotor` 等不同协议电机封装成统一的 `ActuatorData` 结构体。
 
-#### 3.3.2 提供 6 个自定义 hardware_interface
+#### 3.3.2 提供扩展 hardware_interface
 
 标准 ROS control 不提供的功能都由自定义接口补上：
 
 | 接口 | 解决的问题 |
 | --- | --- |
-| `RobotStateInterface` | 让控制器在 1kHz 实时线程中安全读写 TF 数据，而不需要走 ROS 话题（`tf2_ros::Buffer` 不是线程安全的） |
+| `RobotStateInterface` | 把 `robot_state_controller` 创建的同一个 `tf2_ros::Buffer` 作为句柄交给控制器共享；控制器之间不用通过 `/tf` 话题往返，但这层封装**不保证**查表无锁、无分配或硬实时 |
 | `ActuatorExtraInterface` | 旁路存储标定状态（`needCalibration`、`calibrated`、`offset`）。标准 JointHandle 没有这些字段，且不应被标定逻辑污染 |
 | `GpioStateInterface` / `GpioCommandInterface` | 扩展 ROS control 到 GPIO 设备，供标定控制器读霍尔传感器、供 manual 控制电磁铁 |
-| `RmImuSensorInterface` | 提供滤波后的 IMU 姿态四元数（标准 `ImuSensorInterface` 只给原始加速度 / 角速度） |
-| `TofRadarInterface` | 提供 ToF 测距数据，不属于 joint 体系 |
+| `RmImuSensorInterface` | 与标准 `ImuSensorInterface` 共享姿态、角速度和线加速度数组；扩展 handle 额外提供采样时间戳，方便 `orientation_controller` 判断是否有新数据 |
+| `TofRadarInterface` | `rm_control` 中保留的 ToF 扩展接口；当前 `RmEcatHardwareInterface` 未注册它，属于遗留 CAN `rm_hw` 路径的能力 |
 
 #### 3.3.3 管理 Transmission 与标定状态
 
-硬件层负责在关节空间与执行器空间之间做映射：控制器发出的关节指令经过 Transmission 换算为具体的电机指令，电机反馈的编码器数据也经此换算回关节值。标定状态的管理同样由硬件层承载。
+硬件层先把线协议中的编码器码、电流码解成 SI 单位的执行器状态，再由 Transmission 在执行器空间与关节空间之间映射；控制器始终读写关节侧的 rad、rad/s 和 N·m。标定状态及运行时 offset 也由硬件层承载，详见 [hardware](./hardware.md) §2-§4。
 
-队内现在已经不走 Linux 到 CAN 的通信，因此我们只考虑 rm_ecat_hw。
+本文以当前 EtherCAT 启动路径 `rm_ecat_hw.launch` 为主。工作区仍保留 `rm_hw` / `rm_can_hw.launch` 的 Linux-to-CAN 兼容路径及其配置；两套路径不要混作同一份运行时配置。
 
 ### 3.4 架构总结
 
-三个层次的具体运行机制是：ROS control 的 `controller_manager` 负责控制器的生命周期管理（加载/启动/停止），它在 `rm_manual` 节点内部被调用——决策层决定何时切换，`controller_manager` 执行实际切换。每个控制器以动态库插件形式加载，在硬件层的 1kHz 循环中被周期性调用。每个周期执行 **read → 所有活跃 controller 的 update → write** 三步。
+这里有两个同名但职责不同的管理器。`RmEcatHardwareInterface` 内持有 ROS control 的 `controller_manager::ControllerManager`，由 `controlWorker` 在 1kHz 调用其 `update()`，实际执行活跃控制器。`rm_manual` 内的 `rm_common::ControllerManager` 则是约 100Hz 的 ROS 服务客户端：它加载控制器，并把 start/stop 请求发给前者。每个控制周期仍是 **read → 所有活跃 controller 的 update → write**。
 
 三个层次的分工可以归纳为一张表：
 
 | 层次 | 频率 | 通信方式 | 管什么 |
 | --- | --- | --- | --- |
-| 决策层（rm_manual 决策核心<br>+ rm_dbus/rm_vt/rm_referee I/O 驱动）<br>内含 controller_manager | 非实时（~100Hz） | ROS 话题 ↔ 控制层<br>ROS 服务 ↔ controller_manager<br>串口/DBus/图传 ↔ 操作手·裁判系统 | 什么时候做、做什么 |
-| 控制层（rm_controllers） | 1kHz | C++ 指针 ↔ 硬件层 | 算法怎么算 |
-| 硬件抽象层（rm_ecat_hw） | 1kHz | EtherCAT 帧 ↔ 物理硬件 | 跟硬件怎么说话 |
+| 决策层（rm_manual 决策核心<br>+ rm_dbus/rm_vt/rm_referee I/O 驱动） | 非实时（~100Hz） | ROS 话题 ↔ 控制层<br>ROS 服务客户端 ↔ controller_manager<br>串口/DBus/图传 ↔ 操作手·裁判系统 | 什么时候做、做什么 |
+| 控制层（rm_controllers） | controlWorker，目标 1kHz | C++ 句柄 ↔ 硬件抽象层 | 算法怎么算 |
+| 硬件抽象层（rm_ecat_hw） | updateWorker，目标 1kHz | EtherCAT 帧 ↔ 物理硬件 | 跟硬件怎么说话 |
 
 数据流是单向的：**操作手操作遥控器 → 决策层解析为指令 → 控制层执行算法 → 硬件层驱动电机**。反馈走另一条路：**电机编码器 → 硬件层读回来 → 控制层拿来做闭环 → 决策层读到 joint_states 用于显示和判断**。
 

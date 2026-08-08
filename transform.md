@@ -2,7 +2,7 @@
 
 > **前置知识**：[overview](./overview.md)（三层架构）、[hardware](./hardware.md)（理解 joint）
 
-底盘要算里程计、云台要瞄准、视觉要把看到的目标换算到云台该转的角度——这些都在问同一类问题：**"A 相对 B 在哪、朝哪"**。回答这类问题的机制叫 **TF**。这篇讲清楚 TF 是什么、为什么它长成一棵树、rm-controls 怎么把关节和 IMU 变成 TF、以及它为什么没直接用 ROS 标准的那套 TF。
+底盘要算里程计、云台要瞄准、视觉要把看到的目标换算到云台该转的角度——这些都在问同一类问题：**"A 相对 B 在哪、朝哪"**。回答这类问题的机制叫 **TF**。这篇讲清楚 TF 是什么、为什么它长成一棵树、rm-controls 怎么把关节和 IMU 变成 TF，以及它怎样把标准 TF Buffer 接入 ROS control 控制器。
 
 > 本文会讲一点点必要的数学——刚好够解释"为什么是一棵树"和"变换是怎么算的"。但不深入旋转矩阵、四元数的具体运算规则（那可以另开一篇）。你只需要理解**每个变换就是一次"旋转 + 平移"**，以及它们怎么串起来。
 
@@ -82,7 +82,7 @@ class RobotStateController
       rm_control::RobotStateInterface>           // 写 TF（输出）
 ```
 
-一个细节优化：URDF 里的关节分两种——会动的（revolute/prismatic）每帧都要重算变换（存在 `segments_` 列表）；**固定关节**（fixed）永远不变，只需发布一次（存在 `segments_fixed_` 列表）。`init()` 里用 `addChildren()` 递归遍历关节树把两者分开，`update()` 每帧只重算 `segments_`，避免重复计算固定变换。发布走的是实时安全的 `TfRtBroadcaster`（不是标准 `tf2_ros::TransformBroadcaster`）。
+一个细节优化：URDF 里的关节分两种——会动的（revolute/prismatic）每帧都要重算变换（存在 `segments_` 列表）；**固定关节**（fixed）永远不变，只需发布一次（存在 `segments_fixed_` 列表）。`init()` 里用 `addChildren()` 递归遍历关节树把两者分开，`update()` 每帧只重算 `segments_`，避免重复计算固定变换。发布使用 `TfRtBroadcaster`，其底层是 `realtime_tools::RealtimePublisher`；这能避免部分发布侧竞争，但 `sendTransform()` 本身仍会组装消息，不能据此宣称整条发布路径具有硬实时保证。
 
 ### 2.2 它还转发外部 TF
 
@@ -99,9 +99,9 @@ for (auto& tf : tf_msg_.readFromRT()->transforms)
   robot_state_handle_.setTransform(tf, "external");   // authority 标明来源，便于溯源
 ```
 
-这样无论变换来自实时循环还是外部话题，最终都汇入同一份树，其他控制器查询时看到的是完整的一棵。这套"`RealtimeBuffer` 跨线程搬运"的模式在 rm-controls 里到处都是（[shooter](./shooter.md) 收指令、[manual](./manual.md) 收各种回调都用它），值得记住。
+这样无论变换来自实时循环还是外部话题，最终都汇入同一份树，其他控制器查询时看到的是完整的一棵。这套"`RealtimeBuffer` 跨线程搬运"的模式也用于控制器接收非实时命令（例如 [shooter](./shooter.md)），值得记住。
 
-这个"为什么要费劲搬运"的问题，牵出了下一个更根本的设计——rm-controls 为什么要自己搞一套 TF 接口，而不用 ROS 标准的。先讲完 IMU，再回来说。
+这个"为什么要费劲搬运"的问题，牵出了下一个更根本的设计——rm-controls 为什么要通过硬件接口共享标准 TF Buffer。先讲完 IMU，再回来说。
 
 ---
 
@@ -131,7 +131,7 @@ class Controller : public controller_interface::MultiInterfaceController<
     rm_control::RobotStateInterface>    // 查 TF（gimbal_imu→base_link）+ 发布 TF
 ```
 
-`RmImuSensorInterface` 给的是[hardware](./hardware.md) 里提到的**滤波后**的姿态四元数，不是原始加速度。合成 `odom→base_link` 靠查一次 `gimbal_imu→base_link`（来自 URDF，`robot_state_controller` 已经放进树里了）再乘一下。
+`RmImuSensorInterface` 与标准 `ImuSensorInterface` 读取同一份姿态、角速度和线加速度数据；它额外提供采样时间戳，`orientation_controller` 用它判断是否出现新样本。姿态是否已滤波由下游硬件/IMU 管线决定，不是选择这个接口造成的。合成 `odom→base_link` 时，控制器还会查 `gimbal_imu→base_link`（来自 URDF，`robot_state_controller` 已经放进树里）再相乘。
 
 这里能看到两个控制器的**依赖顺序**：`orientation_controller` 要用到 `gimbal_imu→base_link` 这条边，而这条边是 `robot_state_controller` 从 URDF 发布的。所以后者必须先就绪——这也是 overview 里"`robot_state_controller` 属于 `state_controllers`、必须先于其他控制器启动"的原因。
 
@@ -150,22 +150,23 @@ orientation_controller:
 
 ---
 
-## 4. 为什么不用标准 tf2_ros::Buffer
+## 4. 为什么还要 RobotStateInterface
 
-现在回答前面挂起的问题。ROS 本身就有一套成熟的 TF 库 `tf2_ros`——`TransformBroadcaster` 发布、`Buffer` + `TransformListener` 查询。rm-controls 为什么不直接用，而要自定义一个 `RobotStateInterface`？
+ROS 本身已有成熟的 TF 库 `tf2_ros`——`TransformBroadcaster` 发布、`Buffer` + `TransformListener` 查询。当前实现**仍然使用标准 `tf2_ros::Buffer`**；`RobotStateInterface` 的作用是把同一个 Buffer 作为硬件句柄交给控制器插件，而不是替换它。
 
-### 4.1 矛盾：实时线程 vs 非线程安全的 Buffer
+### 4.1 需要解决的是共享与边界
 
-核心矛盾是**实时性和线程安全**：
+`robot_state_controller` 初始化时创建一个 `tf2_ros::Buffer`，再把名为 `robot_state` 的 `RobotStateHandle` 注册到硬件接口。其他控制器据此查询或写入同一棵树：
 
-- rm-controls 的控制器跑在 **1kHz 实时循环**里。底盘、云台每一拍都要查 TF（"云台现在指哪""底盘转了多少"），查询必须又快又稳，不能有不确定的阻塞。
-- 但标准的 `tf2_ros::Buffer` **不是为实时线程设计的**：它内部用锁，`TransformListener` 还会另起订阅线程从 `/tf` 话题反序列化数据。在 1kHz 硬实时循环里,这些锁和序列化带来的抖动是不可接受的。
+- 避免每个控制器各自建 `Buffer + TransformListener`，从而避免重复订阅与相互独立的缓存；
+- 控制器之间直接共享 Buffer，不必把内部 TF 先序列化成 `/tf` 再由另一个控制器订阅；
+- `/tf` 和 `/tf_static` 的外部输入先写入 `RealtimeBuffer`，再由 `robot_state_controller::update()` 汇入该 Buffer；输出则用 `TfRtBroadcaster` 的 realtime publisher 发布。
 
-如果每个控制器各自建一个 `tf2_ros::Buffer` + `TransformListener`，还会有一堆重复的订阅线程、各自维护一份可能不一致的 TF——又慢又乱。
+这解决了数据所有权和话题交接边界，但不把 `tf2_ros::Buffer::lookupTransform()` / `setTransform()` 变成锁自由、无分配或有确定上界的操作。控制 worker 的 1kHz 只是目标周期；对硬实时路径仍应测量最坏耗时、限制查询次数，并处理查不到变换时抛出的异常。
 
-### 4.2 解法：RobotStateInterface —— 一根共享的 TF 数据总线
+### 4.2 RobotStateInterface：共享同一棵树
 
-rm-controls 的解法是把 TF Buffer 做成一个**硬件接口**，让所有控制器在实时线程里安全地共享同一份 TF 树：
+接口本身很薄，只转发同一个标准 Buffer：
 
 ```cpp
 class RobotStateHandle {
@@ -176,23 +177,24 @@ class RobotStateHandle {
 };
 ```
 
-它本质上包了一个 `tf2_ros::Buffer`，但把访问收拢成 `setTransform`（写）/ `lookupTransform`（读）两个动作，通过 `RobotStateInterface` 在所有控制器之间**共享同一个实例**。配合实时安全的工具（`RealtimeBuffer`、自定义的 `TfRtBroadcaster`），做到：
+`setTransform`（写）和 `lookupTransform`（读）通过 `RobotStateInterface` 在控制器之间**共享同一个实例**。配合 `RealtimeBuffer` 与 `TfRtBroadcaster`，当前数据路径是：
 
 - 所有控制器读写的是**同一棵树**，不会各查各的、互相不一致
-- 读写发生在实时循环内，**不走 ROS 话题的序列化**，没有额外线程抖动
-- 外部话题来的 TF（第 2.2 节那个"搬运工"）也通过 `RealtimeBuffer` 安全地汇进这同一棵树
+- 控制器之间的内部查询不走 ROS 话题序列化
+- 外部话题来的 TF 由 `RealtimeBuffer` 跨入控制器 update，再写入同一棵树
+- 出站 `/tf` 使用 realtime publisher 减少发布侧的非实时工作
 
-这就是 overview 里把 `RobotStateInterface` 称作"最重要的自定义接口"的原因——它是一根贯穿全框架的 **TF 数据总线**：一头接生产者，一头接消费者，全在实时线程里安全流转。
+所以它是一根贯穿控制器的 **TF 数据总线**，但不是实时安全性的证明：共享 Buffer、回调交接和发布优化是三件不同的事。
 
 和标准方案对比：
 
 | | 标准 `robot_state_publisher` + tf2 | rm-controls |
 | --- | --- | --- |
 | 形态 | 独立 ROS 节点 | ROS 控制器插件 |
-| 运行位置 | 普通回调 | 1kHz 实时循环 |
-| 广播器 | `tf2_ros::TransformBroadcaster` | `TfRtBroadcaster`（实时安全） |
-| 控制器间共享 | 各自建 Buffer + Listener | 共享一个 `RobotStateInterface` |
-| 外部 TF 转发 | —— | 支持（RealtimeBuffer 汇入） |
+| 运行位置 | 普通 ROS 节点 | ROS control 插件，在 controlWorker 目标 1kHz 周期调用 |
+| 查询缓存 | 各节点可各自维护 Buffer | 一个标准 `tf2_ros::Buffer`，通过 `RobotStateInterface` 共享 |
+| 广播器 | `tf2_ros::TransformBroadcaster` | `TfRtBroadcaster`（realtime publisher 封装） |
+| 外部 TF 转发 | 订阅后直接写本地 Buffer | 订阅回调先入 `RealtimeBuffer`，再由 update 汇入 Buffer |
 
 ---
 
@@ -223,7 +225,7 @@ auto tf = robot_state_handle_.lookupTransform("base_link", "pitch", time);
 - **`odom`** 是固定在世界里的里程计参考原点，`odom → base_link` 表示机器人相对出发点走了多远、转了多少（里程计细节见 [chassis](./chassis.md)）。
 - **`robot_state_controller`**：读关节角度 + URDF 结构 → 发布关节 TF 树；顺带把外部节点的 `/tf` 转发汇入。它属于 `state_controllers`，必须最先启动。
 - **`orientation_controller`**：IMU 装在云台上，测的是"世界→云台",它合成"云台→底盘"得到"世界→底盘"并发布，纠正 IMU 的安装错位。
-- rm-controls 不用标准 `tf2_ros::Buffer`，因为它**不是实时线程安全**的。解法是把 TF Buffer 包成 **`RobotStateInterface`**——一根所有控制器共享、在 1kHz 实时循环里安全读写的 TF 数据总线。
+- rm-controls 仍使用标准 `tf2_ros::Buffer`；**`RobotStateInterface`** 只是把一个共享 Buffer 暴露给控制器。它减少重复 listener 和话题往返，但不保证 `lookupTransform` / `setTransform` 是硬实时操作。
 - 消费者（chassis/gimbal/manual）只需声明接口、调 `lookupTransform`，无需关心 TF 从哪来。
 
 下面进入三个业务领域文档：[chassis](./chassis.md)（底盘怎么动）、[gimbal](./gimbal.md)（云台怎么瞄）、[shooter](./shooter.md)（子弹怎么打）。
