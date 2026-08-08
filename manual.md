@@ -178,6 +178,26 @@ void ManualBase::remoteControlTurnOff() {          // 遥控器掉线
 }
 ```
 
+### 2.4 建议：重连后的武装互锁
+
+边沿检测有一个危险初始化问题：机器人上电或遥控器重连时，射击拨杆/鼠标可能已经保持在“按下”。如果把第一次收到的高电平解释为上升沿，机器人会在操作手没有做新动作的情况下开火。当前 `InputEvent` / `ShooterCommandSender` 没有独立的 `armed` 状态或按 `ShootCmd.stamp` 拒绝过期指令；下面是一项应补充的安全设计，而不是现有实现。
+
+发射输入因此需要一个独立的 `fire_input_armed` 锁存：
+
+```cpp
+if (!remote_fresh || state_ == PASSIVE || shooter_fault) {
+  fire_input_armed = false;
+  saw_release = false;
+} else if (!fire_level) {
+  saw_release = true;                  // 重连后先确认一次松开/中位
+  fire_input_armed = true;
+} else if (fire_input_armed && rising_edge) {
+  requestFire();                       // 只有新的有效边沿才能开火
+}
+```
+
+这里的重点不是变量名，而是规则：**静态射击电平不能当事件，失去安全前提后必须重新观察到释放。** 命令超时、发射掉电、标定未完成、热量保护和卡弹故障也都应撤销武装。长按连发仍可由 `InputEvent` 计时，但应建立在已经武装、输入持续新鲜的前提上。
+
 ---
 
 ## 3. 怎么切换控制器：ControllerManager
@@ -333,6 +353,26 @@ class ShooterCommandSender : ... {
 
 一句话：**加指令 = 定义 msg → 写 sender 子类 → 控制器订阅（RealtimeBuffer）→ 接进 Manual 的事件与聚合发布 → 配好一致的 topic**；当心"每拍发、带时间戳、话题名一致、只打包不执行"。
 
+### 5.2 建议：安全仲裁与状态机边界
+
+当前 `rm_manual` 和发射控制器分别有掉线处理、模式切换、卡弹与热量逻辑，但没有一个覆盖所有条件的统一 fail-closed 总门。下面是建议的仲裁架构，不能当作当前功能说明。
+
+一个机构往往同时有输入手势、正常动作、卡弹恢复、热量预测等多个状态机。它们可以并行或嵌套，但最终发命令前应经过**单向的优先级仲裁**：
+
+```
+掉线 / 急停
+  > 机构掉电 / 未标定
+  > 故障锁定
+  > 自动恢复
+  > 正常操作意图
+```
+
+高优先级条件一旦成立，低优先级状态不得把命令改回危险值。进入或退出外层状态时，要重置内层计时器、积分、一次性事件和待执行目标。例如从“卡弹恢复”退出不能保留恢复前的长按事件，否则下一拍可能直接重新 PUSH。
+
+自动开火还应把操作手和视觉看成**双重许可**：操作手保持开火意图只是第一道门，视觉目标与 `fire` 判定必须带独立时间戳并保持新鲜；视觉“不可信”、超时或目标丢失都应 fail closed。人工“信任视觉”开关只能允许使用这路数据，不能替代新鲜度检查。完整发射许可条件见 [shooter](./shooter.md) §2.1。
+
+所有状态持续时间都用 `ros::Duration` 或累计真实 `period`，不要用固定拍数代替秒数。控制频率调整、某拍超时或仿真步长变化后，固定拍数会悄悄改变安全阈值。
+
 ---
 
 ## 6. 裁判系统交互：功率与热量管理
@@ -341,16 +381,16 @@ class ShooterCommandSender : ... {
 
 ### 6.1 底盘功率管理
 
-[chassis](./chassis.md) 讲过底盘控制器会做功率缩放，但"当前功率上限是多少、现在该充电还是爆发"是决策层给的。`ChassisCommandSender` 内嵌一个 `PowerLimit` 状态机，封装在 `rm_common/decision/power_limit.h` 里。
+[chassis](./chassis.md) 讲过底盘控制器会做功率约束；决策层的职责是选择当前走哪条预算分支。`ChassisCommandSender` 内嵌一个 `PowerLimit` 状态机，封装在 `rm_common/decision/power_limit.h` 里。这里下发的 `power_limit` 是**预算**，不是对实际电气功率的测量保证；控制层仍要结合电机模型、反馈新鲜度和执行器限幅落实它。
 
 #### 5 种模式
 
 ```cpp
 typedef enum {
-  CHARGE = 0,  // 充电：优先给超级电容充
-  BURST = 1,   // 爆发：超电放电补功率
-  NORMAL = 2,  // 正常：仅用裁判系统限制功率
-  ALLOFF = 3,  // 超电关闭
+  CHARGE = 0,  // 降低本地底盘预算的分支
+  BURST = 1,   // 请求高预算的分支
+  NORMAL = 2,  // 常规预算分支
+  ALLOFF = 3,  // 本地状态机中的关闭状态
   TEST = 4,
 } Mode;
 ```
@@ -372,38 +412,22 @@ typedef enum {
               ├─ NORMAL → normal()
               ├─ BURST  → burst(chassis_cmd, is_gyro)
               ├─ CHARGE → charge()
-              └─ default → zero()（功率=0，底盘动不了）
+               └─ default → zero()（功率=0，底盘动不了）
 ```
 
-> **旧超电有什么问题？为什么要换？**
->
-> 所谓"跳"，是指 NUC 和超电之间完成一次功率控制所需的串口**往返次数**。
->
-> **旧超电是两跳**：
->
-> ```
-> 第一跳：NUC → 设模式（CHARGE / BURST / NORMAL）→ 超电
-> 第二跳：超电 → 回报自身状态（cap_state_）→ NUC 读到后才算功率限制
-> ```
->
-> 软件必须先告诉超电"我要爆发"，等超电执行完了再报告"我现在在爆发状态了"，软件确认后才真的把功率限制提上去。一来一回，中间多一个完整的串口往返延迟。有两个痛点：
->
-> 1. **响应慢**：急加速时超电反应跟不上节奏。
-> 2. **耦合紧**：功率计算的正确性依赖超电能否正确回报状态——回报丢了或延迟了，功率限制就算错了。
->
-> **新超电是一跳**：
->
-> ```
-> NUC 直接设 power_limit → 超电自己管充放电
-> ```
->
-> 软件不再跟超电协商状态，直接告诉它"功率上限是多少"，超电内部根据这个值自动决定充放电。一跳完成，响应更快、耦合更低。现在的代码已经只有新超电的路径，`is_new_capacitor_` 标志已被移除。
+各分支结束后还会调用 `applyPosturePowerScale()`。当前成员默认值为 1.0，且这份 `PowerLimit` 没有对外设置它的方法，因此按当前代码通常不改变上面的结果。
 
-为什么旧超电协议不支持一跳？因为它的固件只懂"模式"不懂"功率"——你只能告诉它"我要爆发"，它不知道应该放多少电，还得报告状态回来让 NUC 算。新超电的固件内部多了一个控制回路，可以直接接受 `power_limit` 值，根据负载自动决定充放电电流。**充放电决策从 NUC 挪到了超电固件里**，NUC 的角色从"协商"变成了"指令"。
+> **配置核对**：当前 `PowerLimit` 读取的是 `enable_burst_cap_threshold`、`disable_burst_cap_threshold`、`disable_normal_cap_threshold`、`enable_gyro_cap_threshold`、`disable_gyro_cap_threshold`、`gyro_power` 和 `upstairs_power` 等键。现有多份 `rm_manual/*.yaml` 仍使用 `enable_use_cap_threshold`、`enable_cap_gyro_threshold`、`charge_power`、`standard_power` 等旧键名；它们不是源码中的别名，会触发缺参日志并让相应成员保留默认值。修改车辆配置前应按实际构造函数逐项核对，不能只沿用旧 YAML。
+
+> 当前实现不应被概括成“旧超电两跳、新超电一跳”。`PowerLimit` 是 NUC 侧的本地预算计算器：它根据裁判状态、电源管理数据和 `expect_state_` 写入 `ChassisCmd.power_limit`，自身不发送超电串口控制帧。
+>
+> `rm_manual` 同时会把 `power_limit_state` 放进 `ManualToReferee`。在当前仓库中，`rm_referee` 只把它交给 `ChassisTriggerChangeUi` 更新 UI 图形颜色；没有源码证据证明颜色或 `power_limit` 会直接控制超电。因此，旧/新超电协议、所谓“几跳”以及超电固件如何决定充放电，都需要对应固件或协议文档，不能从这里推导。
+>
+> 配置中仍可见 `is_new_capacitor`，但当前 `PowerLimit` 不读取该字段；它不是当前行为分支。
 
 #### 三种核心模式
 
-**BURST**——超电放电，底盘获得超出裁判限制的功率：
+**BURST**——高预算分支：
 
 ```cpp
 void burst(rm_msgs::ChassisCmd& chassis_cmd, bool is_gyro) {
@@ -420,7 +444,9 @@ void burst(rm_msgs::ChassisCmd& chassis_cmd, bool is_gyro) {
 
 `setBurstPower()` 内部还有迟滞保护（`enable_burst_cap_threshold_` / `disable_burst_cap_threshold_`），防止超电容量在阈值附近来回切。`setGyroPower()` 同理，用另一套 `enable_gyro_cap_threshold_` / `disable_gyro_cap_threshold_`。
 
-**CHARGE**——限制底盘功率，给超电让出充电功率：
+这里的 `is_gyro` 指持续主动自转的小陀螺行为，不等同于底盘正面追随云台的 FOLLOW；两者的模式边界见 [chassis](./chassis.md) §3。
+
+**CHARGE**——降低本地底盘预算：
 
 ```cpp
 void charge(rm_msgs::ChassisCmd& chassis_cmd) {
@@ -429,7 +455,7 @@ void charge(rm_msgs::ChassisCmd& chassis_cmd) {
 }
 ```
 
-**NORMAL**——仅用裁判系统限制功率，超电不主动介入：
+**NORMAL**——常规预算分支：
 
 ```cpp
 void normal(rm_msgs::ChassisCmd& chassis_cmd) {
@@ -444,38 +470,40 @@ void normal(rm_msgs::ChassisCmd& chassis_cmd) {
 }
 ```
 
-注意 normal 模式下的 `extra_power_`：当超电在线且电量充足时，即使 NORMAL 模式也会从超电借少量功率——旧超电用这个参数，新超电设 0 关闭此行为。
+注意 normal 模式下的 `extra_power_`：当前代码仅在电源管理状态非 `ALLOFF`、容量高于阈值且裁判功率缓冲足够时，把 `chassis_power_limit_ + extra_power_` 写入命令，再由 `max_power_limit_` 钳位。不要把它归因到某种“旧/新超电”协议；某车辆把它设为 0 只是配置选择。
 
-#### 上下行路径
+CHARGE 并不是“功率很低”或“免费充电”，而是当前代码主动把本地驱动预算乘以 `0.70`。各迟滞阈值和 `0.3s` 在线判据都只是当前代码/车辆配置的快照，必须结合当季规则、链路频率和实车能量测量验证。更完整的“数据陈旧即撤销 BURST、连续新鲜样本后再恢复”是应补充的安全策略，不是 `PowerLimit` 当前实现的完整状态机。
 
-**下行（超电 → NUC）**：超电的电源管理数据通过 `POWER_MANAGEMENT_SAMPLE_AND_STATUS_DATA_CMD` 帧经同一路串口发上来，`rm_referee` 解包后 publish 成 `power_management/sample_and_status` topic。`PowerLimit::setCapacityData()` 订阅它，更新各字段：
+#### 当前数据路径
 
-| 变量 | 含义 |
+**输入（裁判系统 / 电源管理模块 → NUC）**：电源管理数据由 `rm_referee` 解包并发布到 `power_management/sample_and_status`。`ManualBase` 将其转交给 `PowerLimit::setCapacityData()`；这个函数当前实际使用的字段如下：
+
+| 消息字段 | `PowerLimit` 的当前用途 |
 | --- | --- |
-| `chassis_power` | 电源管理模块输出功率（W） |
-| `capacity_remain_charge` | 超电剩余容量百分比 |
-| `capacity_discharge_power` | 超电当前放电功率 |
-| `state_machine_running_state` | 超电状态（1 = 开，3 = 关） |
+| `stamp` | 每次收到消息时与当前时间比较；小于 0.3 s 时置 `capacity_is_online_ = true` |
+| `capacity_remain_charge` | 写入 `cap_energy_` |
+| `state_machine_running_state` | 写入 `cap_state_` |
+| `chassis_power` / `capacity_discharge_power` | 字段会随消息到达，但此 `PowerLimit` 当前不读取 |
 
-超电在线标志 `capacity_is_online_` 判断：连续 0.3s 收不到数据就置 false。
+`chassis_power_buffer_` 则来自独立的裁判 `PowerHeatData` 消息。裁判在线在 `ManualBase::checkReferee()` 中每轮按最后一条 `PowerHeatData` 的时间戳重新判断；容量在线只在 `setCapacityData()` 收到消息时更新，当前没有“0.3 s 后自动清 false”的独立计时器。两者不能混为一个信号，后者也是现有代码需要补强的点。
 
-> 注意：如果串口读不到裁判系统数据，原因之一可能是超电出了问题——因为物理拓扑是**裁判系统 → 超电 → 电脑**，超电断了，裁判系统的数据也过不来。
+物理拓扑通常是**裁判系统 → 超级电容 → 电脑**，所以串口数据异常可能来自链路中任一环节；仅凭本仓库不能把裁判数据丢失归因到超电故障。
 
-**上行（NUC → 超电）**：`rm_manual` 发 `ManualToReferee` 消息，`rm_referee` 收到后经 `ChassisTriggerChangeUi` 编码进 UI 图形颜色（白 = NORMAL、绿 = CHARGE、黑 = BURST/ALLOFF），再通过同一串口发给裁判系统客户端，裁判系统转给超电。超电根据图形颜色解析出期望状态。开关超电有 0.2s 防误触延迟。
+**状态展示（NUC → 裁判系统客户端 UI）**：`ManualBase::checkReferee()` 发布 `ManualToReferee`；`rm_referee::RefereeBase::manualDataCallBack()` 将其交给 `ChassisTriggerChangeUi`。该 UI 对应 BURST = 橙色、CHARGE = 绿色、NORMAL = 白色、其他状态 = 黑色，并进入 UI 队列后作为裁判系统 UI 帧发送。
 
 ```
-rm_manual                      rm_referee                         串口
-ChassisCommandSender           referee_base                          |
-  └─ PowerLimit                 └─ manualDataCallBack                |
-       └─ updateState(state)         └─ ChassisTriggerChangeUi       |
-            ManualToReferee ───────►       └─ updateConfig(color)───► 裁判系统 → 超电
+rm_manual                              rm_referee
+PowerLimit::getState()
+  └─ ManualToReferee ───────────────► RefereeBase::manualDataCallBack()
+                                          └─ ChassisTriggerChangeUi
+                                               └─ UI 图形 / 串口 UI 帧
 ```
 
-这就补上了 [chassis](./chassis.md) 里"超级电容 CHARGE/NORMAL/BURST 状态机由 PowerLimit 管理"那句话的落点，以及背后一整套上下游数据流。
+这条 UI 路径是状态展示，不应被描述为 NUC 经裁判系统向超电发送控制命令。`PowerLimit::updateState()` 的输入来自 `rm_manual` 自己的事件处理；两条路径在当前代码中彼此独立。
 
 ### 6.2 发射热量管理
 
-[shooter](./shooter.md) 说过"热量限制不在发射控制器、而在决策层"——就在这里。`ShooterCommandSender` 里的 `heat_limit_` 根据裁判系统实时热量和上限，把射频 `hz` 钳在安全范围内：热量快满就降频甚至停发。配置在 rm_manual：
+[shooter](./shooter.md) 说过"热量限制不在发射控制器、而在决策层"——就在这里。`ShooterCommandSender` 里的 `heat_limit_` 根据配置选择本地累计热量或裁判上报热量，再结合裁判给出的上限和冷却速率计算射频 `hz`。配置在 rm_manual：
 
 ```yaml
 shooter:
@@ -483,8 +511,34 @@ shooter:
     low_shoot_frequency:  1
     high_shoot_frequency: 3
     burst_shoot_frequency: 6
+    minimal_shoot_frequency: 1
+    safe_shoot_frequency: 1
+    heat_coeff: 1
+    local_heat_protect_threshold: 0
+    use_local_heat: true
     type: "ID1_42MM"        # 弹丸类型，决定单发热量与上限
 ```
+
+当前 `HeatLimit` 确实接收两类信息，但没有把它们做成带时间戳的融合器：
+
+```
+rm_referee：官方热量 / 上限 / 冷却速度（权威、但有链路延迟）
+                                 ┐
+                                 ├─► heat_limit_ ─► 安全射频 hz ─► ShootCmd
+shooter_controller：疑似射出事件（低延迟、但会误报/漏报）
+                                 ┘
+```
+
+当前行为是：`ShooterCommandSender` 用 `HeatLimit` 计算 `ShootCmd.hz`，控制器只执行射频。`use_local_heat = true` 时用本地累计热量；否则使用裁判上报的枪口热量。它以 `has_shoot` 的 false → true 边沿把本地热量加上单发热量，并由 0.1 s 定时器按冷却速度递减；裁判离线时直接返回固定 5.0 Hz，BURST 模式直接返回配置的爆发射频。
+
+要把这两路数据融合得保守，下面四条是**建议的后续设计**，当前 `HeatLimit` 尚未实现：
+
+1. 官方样本和本地射出事件都带时间戳；
+2. 收到官方热量后先按冷却模型传播到当前时刻，再叠加样本时间之后的本地事件；
+3. 为已下发未检测的弹、漏检与通信延迟预留安全热量，不能把显示余量全部花完；
+4. 官方数据陈旧时采用本地预测的保守上界并降频，不能把掉线解释成“当前热量为 0”。
+
+本地预测方程、持续射频 $c/h$ 和分段降频策略见 [shooter](./shooter.md) §5。每发热量、冷却速度和上限应来自当季裁判数据/配置；教程中的固定数值只代表当时规则，不应写死。
 
 裁判系统还驱动一系列安全事件：血量归零 → `robotDie()` 停掉所有主控制器；复活 → 恢复；各机构电源 ON → 触发对应标定（第 4.2 节）。rm_manual 也会**发回**反馈给裁判系统（功率状态、当前射频、视觉检测颜色等）。
 
@@ -555,10 +609,15 @@ rm_manual:
 - **调底盘最大速度** → `vel.max_linear_x` 分段映射（不在 chassis 控制器里）
 - **调射频/热量策略** → `shooter.heat_limit`
 - **加一个控制器** → 在 `controllers_list` 对应类别里加一行；若是标定控制器，还要加一条标定流水线
-- **加一个需标定的关节** → 参见 [hardware](./hardware.md) 的标定 + 这里的 `calibration_controllers` 与流水线（配置要在 ecat_hw / rm_hw / rm_controllers / rm_manual 四层保持电机名一致）
+- **加一个需标定的关节** → 参见 [hardware](./hardware.md) 的标定 + 这里的 `calibration_controllers` 与流水线；硬件路径、URDF Transmission、`rm_controllers` 和 `rm_manual` 中的 actuator / joint / controller 名称必须逐项核对
 - **改按键/拨杆映射** → 在对应 Manual 子类的事件绑定里（代码层）
 
-> 配置的层次依赖：`rm_ecat_hw`（电机 ID）→ `rm_hw`（滤波、need_calibration）→ `rm_controllers`（type、PID）→ `rm_manual`（控制器清单、标定队列、映射）→ `rm_referee`（robot_id、热量）。修改原则是**从下往上、电机名四层一致**。
+> 硬件配置有两条启动路径，不能混写为同一条链：
+>
+> - **EtherCAT**：`rm_ecat_hw.launch` 传入 `config/rm_ecat_hw/<robot>.yaml`；该 setup 文件再引用 `device_configurations/*.yaml`，其中定义 `can_motors`、IMU、GPIO 等设备。
+> - **遗留 CAN**：`rm_can_hw.launch` 加载 `config/rm_control/rm_hw/actuator_coefficient.yaml` 和 `config/rm_control/rm_hw/<robot>.yaml`，再启动 `rm_hw`。
+>
+> 两条路径最终都要与 URDF Transmission、`rm_controllers/<robot>.yaml` 和 `rm_manual/<robot>.yaml` 的名称及控制器关系一致。`rm_referee/<robot>.yaml` 是独立的裁判串口/UI 配置；机器人 ID、功率和热量由裁判消息提供，不是这条 actuator 配置链的下一层。
 
 ---
 
@@ -566,11 +625,11 @@ rm_manual:
 
 - **决策层 = 决策核心 `rm_manual` + I/O 驱动 `rm_dbus`/`rm_vt`/`rm_referee`**（全非实时）。驱动采集遥控器/图传/裁判系统 → 话题 → 核心，核心的 UI/反馈也经它们发回；`rm_manual` 本身不读串口。
 - **rm_manual 是决策核心**，跑在约 100Hz 的 `ros::Rate` 循环（`run()` + `spinOnce` 驱动的回调），不参与 1kHz 控制环，通过 ROS 话题编排下层——管"什么时候做、做什么"。
-- **InputEvent** 把遥控器/键盘的电平信号转成上升沿/下降沿/长按等事件，之上还有 PASSIVE/IDLE/RC/PC 顶层状态机，断连即回安全态。
+- **InputEvent** 把遥控器/键盘的电平信号转成上升沿/下降沿/长按等事件，之上还有 PASSIVE/IDLE/RC/PC 顶层状态机，断连即回安全态；独立武装互锁与命令新鲜度总门仍是建议补强项。
 - **ControllerManager** 按 state / main / calibration 三类生命周期管理控制器，用缓冲 + 异步原子切换避免 joint 冲突竞态。
 - **CalibrationQueue** 编排标定步骤：按顺序"启标定控制器 + 停主控制器 + 轮询完成",上层只需 `reset()` + `update()`；由裁判系统电源/比赛事件触发重标。
-- **CommandSender** 把决策打包成消息发给下层控制器，指令与执行分离。**新增一条指令通道**（§5.1）：定义 msg → 写 sender 子类 → 控制器 RealtimeBuffer 订阅 → 接进 Manual 事件与聚合发布 → 配一致的 topic；当心每拍都发、带时间戳、话题名一致、只打包不执行。
-- **裁判系统交互**：`PowerLimit`（底盘功率 CHARGE/NORMAL/BURST）和 `heat_limit`（发射热量→射频）都在 CommandSender 里，补上了 chassis/shooter 里留的钩子。
+- **CommandSender** 把决策打包成消息发给下层控制器，指令与执行分离。统一安全仲裁、自动开火双重许可与命令新鲜度总门是建议补强项，不是当前完整实现。
+- **裁判系统交互**：`PowerLimit`（底盘预算 CHARGE/NORMAL/BURST）和 `HeatLimit`（发射热量→射频）都在 CommandSender 里；当前热量模型是本地事件计数器或裁判热量二选一，不是带时间戳的融合器。
 - **兵种差异**用继承 + 模板方法组织：共性在基类，差异在子类，11 种机器人复用同一套下层控制器。
 
 到这里，从最底层的通信硬件、到中间的控制算法、再到最上层的决策编排，整个 rm-controls 的心智模型就完整了。回到 [overview](./overview.md) 那张三层架构图，现在每一格应该都能填上具体内容了。
